@@ -18,7 +18,76 @@ This project follows the three-layer Waybar widget architecture:
 - **Data layer** (`data/`): Network interface data collection from system
 - **Display layer** (`display/`): Waybar JSON formatting
 
-## Building
+## Installation
+
+### For Nix Users
+
+This project provides a Nix flake for reproducible builds and easy integration with NixOS.
+
+#### Quick Start with Nix
+
+```bash
+# Run directly from GitHub (replace with your actual GitHub repo)
+nix run github:yourusername/waybar_lan
+
+# Build locally
+nix build
+
+# The binary will be available at ./result/bin/waybar_lan
+./result/bin/waybar_lan
+```
+
+#### Add to NixOS Configuration
+
+Add this flake as an input in your NixOS configuration:
+
+```nix
+# flake.nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    waybar-lan.url = "github:yourusername/waybar_lan";
+  };
+
+  outputs = { self, nixpkgs, waybar-lan, ... }: {
+    nixosConfigurations.yourhost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        {
+          environment.systemPackages = [
+            waybar-lan.packages.x86_64-linux.default
+          ];
+        }
+      ];
+    };
+  };
+}
+```
+
+#### Use in Home Manager
+
+```nix
+# home.nix
+{ inputs, pkgs, ... }: {
+  home.packages = [
+    inputs.waybar-lan.packages.${pkgs.system}.default
+  ];
+}
+```
+
+#### Development Shell
+
+Enter a development environment with all required tools:
+
+```bash
+nix develop
+
+# Now you have cargo, rust-analyzer, and other tools available
+cargo build
+cargo test
+```
+
+### Building with Cargo
 
 ```bash
 cargo build --release
@@ -58,7 +127,21 @@ Example Waybar config (`~/.config/waybar/config`):
 {
     "custom/lan": {
         "format": "{}",
-        "exec": "/path/to/waybar_lan",
+        "exec": "/path/to/waybar_lan/target/release/waybar_lan",
+        "interval": 30,
+        "return-type": "json",
+        "tooltip": true
+    }
+}
+```
+
+Or for Nix users with the package installed:
+
+```json
+{
+    "custom/lan": {
+        "format": "{}",
+        "exec": "waybar_lan",
         "interval": 30,
         "return-type": "json",
         "tooltip": true
