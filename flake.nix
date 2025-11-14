@@ -24,6 +24,9 @@
 
           cargoLock = { lockFile = ./Cargo.lock; };
 
+          # Skip tests in Nix build - SSDP/mDNS tests require network access
+          doCheck = false;
+
           meta = with pkgs.lib; {
             description = "Waybar LAN widget for monitoring local network devices";
             longDescription = ''
