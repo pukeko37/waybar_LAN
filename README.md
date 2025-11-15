@@ -27,8 +27,8 @@ This project provides a Nix flake for reproducible builds and easy integration w
 #### Quick Start with Nix
 
 ```bash
-# Run directly from GitHub (replace with your actual GitHub repo)
-nix run github:yourusername/waybar_lan
+# Run directly from GitHub
+nix run github:pukeko37/waybar_LAN
 
 # Build locally
 nix build
@@ -46,7 +46,7 @@ Add this flake as an input in your NixOS configuration:
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    waybar-lan.url = "github:yourusername/waybar_lan";
+    waybar-lan.url = "github:pukeko37/waybar_LAN";
   };
 
   outputs = { self, nixpkgs, waybar-lan, ... }: {
