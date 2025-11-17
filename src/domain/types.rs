@@ -109,10 +109,6 @@ impl ManufacturerName {
 pub struct ModelName(String);
 
 impl ModelName {
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -123,20 +119,6 @@ impl ModelName {
 pub struct FriendlyName(String);
 
 impl FriendlyName {
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// UPnP device type URN
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceTypeName(String);
-
-impl DeviceTypeName {
     pub fn new(value: String) -> Self {
         Self(value)
     }
@@ -218,6 +200,38 @@ impl ServiceInfo {
                     .next()
                     .unwrap_or(self.service_type.as_str())
             }
+        }
+    }
+}
+
+/// Kernel neighbor table state from `ip neigh show`
+/// Represents the reachability state maintained by the kernel
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NeighborState {
+    /// Neighbor is reachable (recently confirmed)
+    Reachable,
+    /// Cached but not recently confirmed - may be offline
+    Stale,
+    /// Sending probe to verify reachability
+    Delay,
+    /// Actively probing neighbor
+    Probe,
+    /// Neighbor is unreachable
+    Failed,
+    /// No state available (e.g., from old /proc/net/arp parsing)
+    Unknown,
+}
+
+impl NeighborState {
+    /// Parse neighbor state from ip neigh show output
+    pub fn from_str(s: &str) -> Self {
+        match s.to_uppercase().as_str() {
+            "REACHABLE" => Self::Reachable,
+            "STALE" => Self::Stale,
+            "DELAY" => Self::Delay,
+            "PROBE" => Self::Probe,
+            "FAILED" => Self::Failed,
+            _ => Self::Unknown,
         }
     }
 }
@@ -392,32 +406,6 @@ impl Default for DeviceIdentity {
     }
 }
 
-/// UPnP device information
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UpnpInfo {
-    pub friendly_name: Option<FriendlyName>,
-    pub manufacturer: Option<ManufacturerName>,
-    pub model_name: Option<ModelName>,
-    pub device_type: Option<DeviceTypeName>,
-}
-
-impl UpnpInfo {
-    pub fn new() -> Self {
-        Self {
-            friendly_name: None,
-            manufacturer: None,
-            model_name: None,
-            device_type: None,
-        }
-    }
-}
-
-impl Default for UpnpInfo {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Network device discovered on the LAN
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkDevice {
@@ -426,8 +414,8 @@ pub struct NetworkDevice {
     pub hostname: Hostname,
     pub interface_name: InterfaceName,
     pub services: Vec<ServiceInfo>,
-    pub upnp_info: Option<UpnpInfo>,
     pub last_seen: SystemTime,
+    pub neighbor_state: NeighborState,
     pub identity: DeviceIdentity,
 }
 
@@ -439,15 +427,23 @@ impl NetworkDevice {
             hostname: Hostname::Resolving,
             interface_name,
             services: Vec::new(),
-            upnp_info: None,
             last_seen: SystemTime::now(),
+            neighbor_state: NeighborState::Unknown,
             identity: DeviceIdentity::new(),
         }
     }
 
-    /// Get activity status based on last seen time
+    /// Get activity status based on neighbor state and last seen time
+    /// Prioritizes kernel neighbor table state over time-based calculation
     pub fn activity_status(&self) -> ActivityStatus {
-        ActivityStatus::from_last_seen(self.last_seen)
+        match self.neighbor_state {
+            NeighborState::Reachable | NeighborState::Delay | NeighborState::Probe => {
+                ActivityStatus::Active
+            }
+            NeighborState::Stale => ActivityStatus::Stale,
+            NeighborState::Failed => ActivityStatus::Stale,
+            NeighborState::Unknown => ActivityStatus::from_last_seen(self.last_seen),
+        }
     }
 
     /// Update last seen time to now
@@ -468,33 +464,10 @@ impl NetworkDevice {
 
     /// Infer device type from available information
     fn infer_device_type(&self) -> DeviceType {
-        self.infer_from_upnp()
-            .or_else(|| self.infer_from_services())
+        self.infer_from_services()
             .or_else(|| self.infer_from_manufacturer_and_model())
             .or_else(|| self.infer_from_hostname())
             .unwrap_or(DeviceType::Unknown)
-    }
-
-    /// Infer device type from UPnP device type URN
-    fn infer_from_upnp(&self) -> Option<DeviceType> {
-        let upnp = self.upnp_info.as_ref()?;
-        let device_type = upnp.device_type.as_ref()?;
-        let device_type_lower = device_type.as_str().to_lowercase();
-
-        if device_type_lower.contains("mediarenderer") {
-            // Check services to determine if TV or speaker
-            if self.has_service("_airplay") || self.has_service("_googlecast") {
-                return Some(DeviceType::Television);
-            }
-            return Some(DeviceType::Speaker);
-        }
-        if device_type_lower.contains("internetgatewaydevice") {
-            return Some(DeviceType::Router);
-        }
-        if device_type_lower.contains("mediaserver") {
-            return Some(DeviceType::NAS);
-        }
-        None
     }
 
     /// Infer device type from mDNS service types
@@ -520,10 +493,6 @@ impl NetworkDevice {
 
     /// Infer device type from manufacturer and model with service heuristics
     fn infer_from_manufacturer_and_model(&self) -> Option<DeviceType> {
-        let manufacturer_from_upnp = self.upnp_info.as_ref()
-            .and_then(|upnp| upnp.manufacturer.as_ref())
-            .map(|m| m.as_str().to_lowercase());
-
         let manufacturer_from_hostname = if let Hostname::Resolved(hostname) = &self.hostname {
             Some(hostname.to_lowercase())
         } else {
@@ -535,8 +504,7 @@ impl NetworkDevice {
             name.contains("samsung") || name.contains("lg") || name.contains("sony")
                 || name.contains("vizio") || name.contains("tcl") || name.contains("hisense")
         };
-        let has_tv_brand = manufacturer_from_upnp.as_ref().map(|m| is_tv_brand(m)).unwrap_or(false)
-            || manufacturer_from_hostname.as_ref().map(|m| is_tv_brand(m)).unwrap_or(false);
+        let has_tv_brand = manufacturer_from_hostname.as_ref().map(|m| is_tv_brand(m)).unwrap_or(false);
 
         if has_tv_brand && (self.has_service("_airplay") || self.has_service("_googlecast")
             || self.has_service("_spotify-connect") || self.has_service("_raop")) {
@@ -548,31 +516,17 @@ impl NetworkDevice {
             name.contains("brother") || name.contains("hp") || name.contains("canon")
                 || name.contains("epson") || name.contains("xerox")
         };
-        let has_printer_brand = manufacturer_from_upnp.as_ref().map(|m| is_printer_brand(m)).unwrap_or(false)
-            || manufacturer_from_hostname.as_ref().map(|m| is_printer_brand(m)).unwrap_or(false);
+        let has_printer_brand = manufacturer_from_hostname.as_ref().map(|m| is_printer_brand(m)).unwrap_or(false);
 
         if has_printer_brand {
             return Some(DeviceType::Printer);
         }
 
-        // Check for NAS manufacturers
-        if let Some(mfr) = &manufacturer_from_upnp
-            && (mfr.contains("synology") || mfr.contains("qnap"))
+        // Check for NAS manufacturers in hostname
+        if let Some(hostname) = &manufacturer_from_hostname
+            && (hostname.contains("synology") || hostname.contains("qnap"))
         {
             return Some(DeviceType::NAS);
-        }
-
-        // Check model names for mobile devices
-        if let Some(upnp) = &self.upnp_info
-            && let Some(model) = &upnp.model_name
-        {
-            let model_lower = model.as_str().to_lowercase();
-            if model_lower.contains("ipad") {
-                return Some(DeviceType::Tablet);
-            }
-            if model_lower.contains("iphone") {
-                return Some(DeviceType::MobileDevice);
-            }
         }
 
         None
@@ -607,34 +561,7 @@ impl NetworkDevice {
 
     /// Extract manufacturer from available sources
     fn extract_manufacturer(&self) -> Option<ManufacturerName> {
-        // Priority 1: UPnP manufacturer field
-        if let Some(upnp) = &self.upnp_info
-            && let Some(mfr) = &upnp.manufacturer
-            && !mfr.as_str().is_empty()
-        {
-            return Some(mfr.clone());
-        }
-
-        // Priority 2: Extract from friendly name
-        if let Some(upnp) = &self.upnp_info
-            && let Some(friendly) = &upnp.friendly_name
-        {
-            // Try to extract manufacturer from patterns like "Samsung Smart TV"
-            let parts: Vec<&str> = friendly.as_str().split_whitespace().collect();
-            if !parts.is_empty() {
-                let first = parts[0];
-                // Check if it looks like a manufacturer name
-                let known_manufacturers = ["Samsung", "LG", "Sony", "Brother", "HP",
-                                          "Canon", "Epson", "Apple", "Google", "Amazon"];
-                for mfr in &known_manufacturers {
-                    if first.eq_ignore_ascii_case(mfr) {
-                        return Some(ManufacturerName::new(mfr.to_string()));
-                    }
-                }
-            }
-        }
-
-        // Priority 3: Extract from hostname
+        // Extract from hostname
         if let Hostname::Resolved(hostname) = &self.hostname {
             let hostname_lower = hostname.to_lowercase();
             let known_manufacturers = ["samsung", "lg", "sony", "brother", "hp",
@@ -655,28 +582,14 @@ impl NetworkDevice {
 
     /// Extract model from available sources
     fn extract_model(&self) -> Option<ModelName> {
-        // Priority 1: UPnP model name
-        if let Some(upnp) = &self.upnp_info
-            && let Some(model) = &upnp.model_name
-            && !model.as_str().is_empty()
-        {
-            return Some(model.clone());
-        }
-
+        // Currently no sources for model name without UPnP
+        // Could be extended to parse from mDNS TXT records if available
         None
     }
 
     /// Extract friendly name from available sources
     fn extract_friendly_name(&self) -> Option<FriendlyName> {
-        // Priority 1: UPnP friendly name (but only if it's descriptive)
-        if let Some(upnp) = &self.upnp_info
-            && let Some(friendly) = &upnp.friendly_name
-            && !friendly.as_str().is_empty() && !friendly.as_str().contains("uuid")
-        {
-            return Some(friendly.clone());
-        }
-
-        // Priority 2: DNS hostname (if available and descriptive)
+        // DNS hostname (if available and descriptive)
         if let Hostname::Resolved(hostname) = &self.hostname
             && !hostname.is_empty() && !hostname.starts_with('_')
         {

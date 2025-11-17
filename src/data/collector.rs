@@ -1,9 +1,32 @@
 //! Network data collection from system interfaces.
 
-use crate::domain::{NetworkData, NetworkSnapshot, UpnpInfo, FriendlyName, ManufacturerName, ModelName, DeviceTypeName};
-use crate::data::{mdns_discovery::MdnsDiscovery, proc_parsers, ssdp_discovery::SsdpDiscovery};
+use crate::domain::{NetworkData, NetworkSnapshot, ServiceInfo, NetworkInterface, Gateway, Hostname};
+use crate::data::{mdns_discovery::MdnsDiscovery, proc_parsers};
 use anyhow::Result;
+use serde::{Serialize, Deserialize};
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::time::Duration;
+
+/// Raw network collection data before processing
+/// Contains all discovered data including incomplete/stale entries
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawNetworkData {
+    /// All lines from ip neigh show (with state information)
+    pub neighbor_table_raw: Vec<String>,
+    /// All lines from /proc/net/arp (including incomplete entries) - DEPRECATED
+    pub arp_table_raw: Vec<String>,
+    /// mDNS services discovered
+    pub mdns_services: HashMap<IpAddr, Vec<ServiceInfo>>,
+    /// Reverse DNS lookup results
+    pub dns_lookups: HashMap<IpAddr, Hostname>,
+    /// Network interfaces
+    pub interfaces: Vec<NetworkInterface>,
+    /// Default gateway
+    pub gateway: Option<Gateway>,
+    /// DNS servers
+    pub dns_servers: Vec<IpAddr>,
+}
 
 /// Collects network information from local system
 pub struct NetworkCollector;
@@ -12,6 +35,76 @@ impl NetworkCollector {
     /// Creates a new NetworkCollector instance
     pub fn new() -> Result<Self> {
         Ok(Self)
+    }
+
+    /// Collects raw network data including all ARP entries (even incomplete)
+    /// This is useful for debugging and analyzing what data is available
+    pub fn collect_raw_network_data(&self) -> Result<RawNetworkData> {
+        // Get all network interfaces
+        let interfaces = proc_parsers::get_network_interfaces()?;
+
+        // Perform ping sweep to populate neighbor table
+        proc_parsers::ping_sweep_subnet(&interfaces)?;
+
+        // Read raw neighbor table (with state information)
+        let neighbor_table_raw = proc_parsers::read_raw_neighbor_table()?;
+
+        // Read raw ARP table (all lines, including incomplete entries) - kept for compatibility
+        let arp_table_raw = proc_parsers::read_raw_arp_table()?;
+
+        // Get devices from neighbor table (for DNS lookups)
+        let arp_devices = proc_parsers::parse_arp_table()?;
+
+        // Discover mDNS services (longer timeout for comprehensive discovery)
+        eprintln!("Discovering mDNS services (5s timeout)...");
+        let mdns_services = match MdnsDiscovery::new()
+            .and_then(|discovery| discovery.discover_services(Duration::from_secs(5))) {
+            Ok(services) => {
+                eprintln!("  Found mDNS services on {} IPs", services.len());
+                services
+            }
+            Err(e) => {
+                eprintln!("  mDNS discovery failed: {}", e);
+                HashMap::new()
+            }
+        };
+
+        // Perform reverse DNS lookups for all ARP devices
+        let device_ips: Vec<_> = arp_devices.iter().map(|d| d.ip).collect();
+        eprintln!("Performing reverse DNS lookups for {} IPs...", device_ips.len());
+        let dns_lookups: HashMap<IpAddr, Hostname> = std::thread::scope(|s| {
+            device_ips
+                .iter()
+                .map(|ip| {
+                    let ip_val = *ip;
+                    s.spawn(move || (ip_val, proc_parsers::reverse_dns_lookup(&ip_val)))
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().unwrap_or_else(|_| {
+                    // Handle thread panic
+                    (device_ips[0], Hostname::Unknown)
+                }))
+                .collect()
+        });
+        let resolved_count = dns_lookups.values().filter(|h| matches!(h, Hostname::Resolved(_))).count();
+        eprintln!("  Resolved {} hostnames", resolved_count);
+
+        // Get default gateway
+        let gateway = proc_parsers::parse_default_gateway()?;
+
+        // Get DNS servers
+        let dns_servers = proc_parsers::parse_dns_servers().unwrap_or_default();
+
+        Ok(RawNetworkData {
+            neighbor_table_raw,
+            arp_table_raw,
+            mdns_services,
+            dns_lookups,
+            interfaces,
+            gateway,
+            dns_servers,
+        })
     }
 
     /// Collects current network information snapshot
@@ -31,12 +124,7 @@ impl NetworkCollector {
             .and_then(|discovery| discovery.discover_services(Duration::from_secs(3)))
             .unwrap_or_default();
 
-        // Discover SSDP/UPnP devices (with 2 second timeout)
-        let ssdp_devices = SsdpDiscovery::new()
-            .discover_devices(Duration::from_secs(2))
-            .unwrap_or_default();
-
-        // Enrich devices with mDNS and UPnP information
+        // Enrich devices with mDNS information
         // Extract mDNS instance names for later hostname priority decision
         let (devices, mdns_names) = devices.into_iter().fold(
             (Vec::new(), std::collections::HashMap::new()),
@@ -55,24 +143,13 @@ impl NetworkCollector {
                     }
                 }
 
-                // Add UPnP device info
-                if let Some(upnp_device_info) = ssdp_devices.get(&device.ip) {
-                    device.upnp_info = Some(UpnpInfo {
-                        friendly_name: upnp_device_info.friendly_name.as_ref().map(|s| FriendlyName::new(s.clone())),
-                        manufacturer: upnp_device_info.manufacturer.as_ref().map(|s| ManufacturerName::new(s.clone())),
-                        model_name: upnp_device_info.model_name.as_ref().map(|s| ModelName::new(s.clone())),
-                        device_type: upnp_device_info.device_type.as_ref().map(|s| DeviceTypeName::new(s.clone())),
-                    });
-                    device.update_last_seen();
-                }
-
                 enriched.push(device);
                 (enriched, names)
             },
         );
 
         // Perform reverse DNS lookups in parallel and apply hostname priority logic
-        // Priority: UPnP friendly_name > DNS > mDNS instance name > Unknown
+        // Priority: DNS > mDNS instance name > Unknown
         let devices = {
             let device_ips: Vec<_> = devices.iter().map(|d| d.ip).collect();
 
@@ -92,18 +169,8 @@ impl NetworkCollector {
                 .into_iter()
                 .zip(dns_results)
                 .map(|(mut device, dns_hostname)| {
-                    // Apply hostname priority logic
-                    device.hostname = if let Some(upnp) = &device.upnp_info {
-                        if let Some(friendly_name) = &upnp.friendly_name {
-                            if !friendly_name.as_str().is_empty() {
-                                crate::domain::Hostname::resolved(friendly_name.as_str().to_string())
-                            } else {
-                                dns_hostname
-                            }
-                        } else {
-                            dns_hostname
-                        }
-                    } else if let crate::domain::Hostname::Resolved(_) = dns_hostname {
+                    // Apply hostname priority logic: DNS > mDNS > Unknown
+                    device.hostname = if let crate::domain::Hostname::Resolved(_) = dns_hostname {
                         dns_hostname
                     } else if let Some(mdns_name) = mdns_names.get(&device.ip) {
                         crate::domain::Hostname::resolved(mdns_name.clone())

@@ -59,28 +59,52 @@ impl MdnsDiscovery {
             let wait_time = check_interval.min(remaining);
 
             for receiver in &receivers {
-                // Check each receiver with a reasonable timeout
-                if let Ok(ServiceEvent::ServiceResolved(info)) = receiver.recv_timeout(wait_time) {
-                    // Extract IP addresses from the service info
-                    // Access fields directly as they are public
-                    for scoped_addr in &info.addresses {
-                        // Convert ScopedIp to IpAddr
-                        let ip = match scoped_addr {
-                            mdns_sd::ScopedIp::V4(v4) => IpAddr::V4(*v4.addr()),
-                            mdns_sd::ScopedIp::V6(v6) => IpAddr::V6(*v6.addr()),
-                            _ => continue, // Skip unknown IP types
-                        };
+                // Drain all available events from this receiver before moving to next
+                // First event: wait up to wait_time
+                // Subsequent events: non-blocking check to drain queue
+                let mut first_event = true;
+                loop {
+                    let timeout_duration = if first_event {
+                        wait_time
+                    } else {
+                        Duration::from_millis(0)
+                    };
 
-                        let service_info = ServiceInfo::new(
-                            ServiceType::new(info.ty_domain.clone()),
-                            ServiceInstanceName::new(info.fullname.clone()),
-                            info.port,
-                        );
+                    match receiver.recv_timeout(timeout_duration) {
+                        Ok(ServiceEvent::ServiceResolved(info)) => {
+                            // Extract IP addresses from the service info
+                            // Access fields directly as they are public
+                            for scoped_addr in &info.addresses {
+                                // Convert ScopedIp to IpAddr
+                                let ip = match scoped_addr {
+                                    mdns_sd::ScopedIp::V4(v4) => IpAddr::V4(*v4.addr()),
+                                    mdns_sd::ScopedIp::V6(v6) => IpAddr::V6(*v6.addr()),
+                                    _ => continue, // Skip unknown IP types
+                                };
 
-                        services_by_ip
-                            .entry(ip)
-                            .or_default()
-                            .push(service_info);
+                                let service_info = ServiceInfo::new(
+                                    ServiceType::new(info.ty_domain.clone()),
+                                    ServiceInstanceName::new(info.fullname.clone()),
+                                    info.port,
+                                );
+
+                                services_by_ip
+                                    .entry(ip)
+                                    .or_default()
+                                    .push(service_info);
+                            }
+                            first_event = false;
+                        }
+                        Ok(ServiceEvent::ServiceFound(_, _)) => {
+                            first_event = false;
+                        }
+                        Ok(_) => {
+                            first_event = false;
+                        }
+                        Err(_) => {
+                            // Timeout or no more events - move to next receiver
+                            break;
+                        }
                     }
                 }
             }

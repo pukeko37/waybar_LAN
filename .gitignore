@@ -47,3 +47,6 @@ pids
 # API keys and secrets (additional security)
 api-key.txt
 secrets.txt
+
+# Network audit debug dumps
+my_network_audit/

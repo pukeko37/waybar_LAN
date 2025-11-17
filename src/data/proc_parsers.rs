@@ -1,6 +1,6 @@
 //! Parsers for /proc filesystem network data
 
-use crate::domain::{Gateway, Hostname, InterfaceName, MacAddress, NetworkDevice, NetworkInterface};
+use crate::domain::{Gateway, Hostname, InterfaceName, MacAddress, NeighborState, NetworkDevice, NetworkInterface};
 use anyhow::{Context, Result};
 use network_interface::{NetworkInterface as NetIface, NetworkInterfaceConfig};
 use std::collections::HashSet;
@@ -8,45 +8,83 @@ use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::process::{Command, Stdio};
 
-/// Parses /proc/net/arp to get neighbor table entries
-/// Format: IP address  HW type  Flags  HW address  Mask  Device
-/// Flag 0x2 = complete entry, 0x0 = incomplete
-pub fn parse_arp_table() -> Result<Vec<NetworkDevice>> {
+/// Reads raw neighbor table output from `ip neigh show`
+/// Returns all lines for debugging and analysis
+pub fn read_raw_neighbor_table() -> Result<Vec<String>> {
+    let output = Command::new("ip")
+        .args(["neigh", "show"])
+        .output()
+        .context("Failed to execute 'ip neigh show'")?;
+
+    let content = String::from_utf8_lossy(&output.stdout);
+    Ok(content.lines().map(|line| line.to_string()).collect())
+}
+
+/// Reads raw ARP table lines including incomplete entries
+/// Returns all non-header lines from /proc/net/arp for debugging
+/// DEPRECATED: Use read_raw_neighbor_table() for state information
+pub fn read_raw_arp_table() -> Result<Vec<String>> {
     let content = fs::read_to_string("/proc/net/arp")
         .context("Failed to read /proc/net/arp")?;
 
+    Ok(content
+        .lines()
+        .skip(1) // Skip header
+        .map(|line| line.to_string())
+        .collect())
+}
+
+/// Parses `ip neigh show` to get neighbor table entries with state information
+/// Format: <IP> dev <IFACE> lladdr <MAC> <STATE>
+/// Example: 192.168.1.1 dev eth0 lladdr aa:bb:cc:dd:ee:ff REACHABLE
+pub fn parse_arp_table() -> Result<Vec<NetworkDevice>> {
+    let output = Command::new("ip")
+        .args(["neigh", "show"])
+        .output()
+        .context("Failed to execute 'ip neigh show'")?;
+
+    let content = String::from_utf8_lossy(&output.stdout);
     let mut devices = Vec::new();
 
-    for line in content.lines().skip(1) {
-        // Skip header line
+    for line in content.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 6 {
+        if parts.len() < 4 {
             continue; // Skip malformed lines
         }
 
-        // Parse flag to check if entry is complete
-        let flags = parts[2];
-        if flags != "0x2" {
-            continue; // Skip incomplete entries
-        }
-
-        // Parse IP address
+        // Parse IP address (first field)
         let ip: IpAddr = match parts[0].parse() {
             Ok(ip) => ip,
             Err(_) => continue, // Skip invalid IPs
         };
 
-        // Parse MAC address
-        let mac_str = parts[3];
-        let mac = match MacAddress::new(mac_str.to_string()) {
-            Ok(mac) => mac,
-            Err(_) => continue, // Skip invalid MACs
-        };
+        // Find interface name (after "dev")
+        let interface_name = parts
+            .iter()
+            .position(|&s| s == "dev")
+            .and_then(|idx| parts.get(idx + 1))
+            .map(|s| s.to_string());
 
-        // Get interface name
-        let interface_name = parts[5].to_string();
+        let Some(iface) = interface_name else { continue };
 
-        devices.push(NetworkDevice::new(ip, mac, InterfaceName::new(interface_name)));
+        // Find MAC address (after "lladdr")
+        let mac = parts
+            .iter()
+            .position(|&s| s == "lladdr")
+            .and_then(|idx| parts.get(idx + 1))
+            .and_then(|&mac_str| MacAddress::new(mac_str.to_string()).ok());
+
+        let Some(mac) = mac else { continue }; // Skip entries without MAC
+
+        // Parse neighbor state (typically last field)
+        let neighbor_state = parts
+            .last()
+            .map(|s| NeighborState::from_str(s))
+            .unwrap_or(NeighborState::Unknown);
+
+        let mut device = NetworkDevice::new(ip, mac, InterfaceName::new(iface));
+        device.neighbor_state = neighbor_state;
+        devices.push(device);
     }
 
     Ok(devices)

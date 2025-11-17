@@ -4,7 +4,6 @@ pub mod collector;
 pub mod mdns_discovery;
 pub mod models;
 pub mod proc_parsers;
-pub mod ssdp_discovery;
 
 pub use collector::*;
 
