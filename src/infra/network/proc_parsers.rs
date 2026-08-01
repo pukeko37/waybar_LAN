@@ -1,6 +1,7 @@
 //! Parsers for /proc filesystem network data
 
-use crate::domain::{Gateway, Hostname, InterfaceName, MacAddress, NeighborState, NetworkDevice, NetworkInterface};
+use crate::domain::{Gateway, Hostname, NetworkDevice, NetworkInterface};
+use crate::infra::network::models::{InterfaceDto, NeighborEntryDto};
 use anyhow::{Context, Result};
 use network_interface::{NetworkInterface as NetIface, NetworkInterfaceConfig};
 use std::collections::HashSet;
@@ -34,9 +35,35 @@ pub fn read_raw_arp_table() -> Result<Vec<String>> {
         .collect())
 }
 
-/// Parses `ip neigh show` to get neighbor table entries with state information
+/// Parses one `ip neigh show` line into a `NeighborEntryDto`.
 /// Format: <IP> dev <IFACE> lladdr <MAC> <STATE>
 /// Example: 192.168.1.1 dev eth0 lladdr aa:bb:cc:dd:ee:ff REACHABLE
+fn parse_neighbor_line(line: &str) -> Option<NeighborEntryDto> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() < 4 {
+        return None; // Skip malformed lines
+    }
+
+    let ip: IpAddr = parts[0].parse().ok()?;
+
+    let interface = parts
+        .iter()
+        .position(|&s| s == "dev")
+        .and_then(|idx| parts.get(idx + 1))
+        .map(|s| s.to_string())?;
+
+    let mac = parts
+        .iter()
+        .position(|&s| s == "lladdr")
+        .and_then(|idx| parts.get(idx + 1))
+        .map(|s| s.to_string())?;
+
+    let state = parts.last().map(|s| s.to_string()).unwrap_or_default();
+
+    Some(NeighborEntryDto { ip, interface, mac, state })
+}
+
+/// Parses `ip neigh show` to get neighbor table entries with state information
 pub fn parse_arp_table() -> Result<Vec<NetworkDevice>> {
     let output = Command::new("ip")
         .args(["neigh", "show"])
@@ -44,50 +71,12 @@ pub fn parse_arp_table() -> Result<Vec<NetworkDevice>> {
         .context("Failed to execute 'ip neigh show'")?;
 
     let content = String::from_utf8_lossy(&output.stdout);
-    let mut devices = Vec::new();
 
-    for line in content.lines() {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 4 {
-            continue; // Skip malformed lines
-        }
-
-        // Parse IP address (first field)
-        let ip: IpAddr = match parts[0].parse() {
-            Ok(ip) => ip,
-            Err(_) => continue, // Skip invalid IPs
-        };
-
-        // Find interface name (after "dev")
-        let interface_name = parts
-            .iter()
-            .position(|&s| s == "dev")
-            .and_then(|idx| parts.get(idx + 1))
-            .map(|s| s.to_string());
-
-        let Some(iface) = interface_name else { continue };
-
-        // Find MAC address (after "lladdr")
-        let mac = parts
-            .iter()
-            .position(|&s| s == "lladdr")
-            .and_then(|idx| parts.get(idx + 1))
-            .and_then(|&mac_str| MacAddress::new(mac_str.to_string()).ok());
-
-        let Some(mac) = mac else { continue }; // Skip entries without MAC
-
-        // Parse neighbor state (typically last field)
-        let neighbor_state = parts
-            .last()
-            .map(|s| NeighborState::from_str(s))
-            .unwrap_or(NeighborState::Unknown);
-
-        let mut device = NetworkDevice::new(ip, mac, InterfaceName::new(iface));
-        device.neighbor_state = neighbor_state;
-        devices.push(device);
-    }
-
-    Ok(devices)
+    Ok(content
+        .lines()
+        .filter_map(parse_neighbor_line)
+        .filter_map(|dto| NetworkDevice::try_from(dto).ok())
+        .collect())
 }
 
 /// Parses /proc/net/route to find the default gateway
@@ -146,26 +135,18 @@ pub fn get_network_interfaces() -> Result<Vec<NetworkInterface>> {
     let system_interfaces = NetIface::show()
         .context("Failed to enumerate network interfaces")?;
 
-    let mut interfaces = Vec::new();
-
-    for iface in system_interfaces {
-        // Get the first IPv4 address for each interface
-        if let Some(addr) = iface.addr.iter().find(|a| matches!(a.ip(), IpAddr::V4(_))) {
-            let ip = addr.ip();
-
-            // Try to get MAC address
-            let mac = iface.mac_addr
-                .and_then(|mac_str| MacAddress::new(mac_str).ok());
-
-            interfaces.push(NetworkInterface::new(
-                InterfaceName::new(iface.name.clone()),
-                ip,
-                mac,
-            ));
-        }
-    }
-
-    Ok(interfaces)
+    Ok(system_interfaces
+        .into_iter()
+        .filter_map(|iface| {
+            let addr = iface.addr.iter().find(|a| matches!(a.ip(), IpAddr::V4(_)))?;
+            Some(InterfaceDto {
+                name: iface.name.clone(),
+                ip: addr.ip(),
+                mac: iface.mac_addr.clone(),
+            })
+        })
+        .map(NetworkInterface::from)
+        .collect())
 }
 
 /// Performs reverse DNS lookup for an IP address
@@ -284,20 +265,19 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_arp_line_incomplete() {
-        let line = "192.168.1.51     0x1         0x0         00:00:00:00:00:00     *        eth0";
-        let parts: Vec<&str> = line.split_whitespace().collect();
+    fn test_parse_neighbor_line_complete() {
+        let line = "192.168.1.1 dev eth0 lladdr aa:bb:cc:dd:ee:ff REACHABLE";
+        let dto = parse_neighbor_line(line).unwrap();
 
-        assert_eq!(parts[2], "0x0"); // Incomplete flag
+        assert_eq!(dto.interface, "eth0");
+        assert_eq!(dto.mac, "aa:bb:cc:dd:ee:ff");
+        assert_eq!(dto.state, "REACHABLE");
     }
 
     #[test]
-    fn test_mac_address_validation() {
-        let valid_mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string());
-        assert!(valid_mac.is_ok());
-
-        let invalid_mac = MacAddress::new("00:00:00:00:00:00".to_string());
-        assert!(invalid_mac.is_ok()); // Still valid format, just all zeros
+    fn test_parse_neighbor_line_missing_lladdr_skipped() {
+        let line = "192.168.1.1 dev eth0 FAILED";
+        assert!(parse_neighbor_line(line).is_none());
     }
 
     #[test]
@@ -349,7 +329,7 @@ mod tests {
 
     #[test]
     fn test_subnet_deduplication() {
-        use crate::domain::NetworkInterface;
+        use crate::domain::{InterfaceName, NetworkInterface};
         use std::net::IpAddr;
 
         // Create two interfaces on the same /24 subnet
@@ -376,13 +356,13 @@ mod tests {
         let mut unique_subnets = Vec::new();
 
         for iface in &interfaces {
-            if let IpAddr::V4(ipv4) = iface.ip {
-                if !ipv4.is_loopback() {
-                    let octets = ipv4.octets();
-                    let subnet_prefix = (octets[0], octets[1], octets[2]);
-                    if seen_subnets.insert(subnet_prefix) {
-                        unique_subnets.push(subnet_prefix);
-                    }
+            if let IpAddr::V4(ipv4) = iface.ip
+                && !ipv4.is_loopback()
+            {
+                let octets = ipv4.octets();
+                let subnet_prefix = (octets[0], octets[1], octets[2]);
+                if seen_subnets.insert(subnet_prefix) {
+                    unique_subnets.push(subnet_prefix);
                 }
             }
         }
@@ -407,10 +387,11 @@ mod tests {
                 continue;
             }
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 2 && parts[0] == "nameserver" {
-                if let Ok(ip) = parts[1].parse::<IpAddr>() {
-                    dns_servers.push(ip);
-                }
+            if parts.len() >= 2
+                && parts[0] == "nameserver"
+                && let Ok(ip) = parts[1].parse::<IpAddr>()
+            {
+                dns_servers.push(ip);
             }
         }
 

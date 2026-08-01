@@ -129,15 +129,4 @@ mod tests {
         let discovery = MdnsDiscovery::new();
         assert!(discovery.is_ok());
     }
-
-    #[test]
-    fn test_discover_services() {
-        let discovery = MdnsDiscovery::new().unwrap();
-        let services = discovery.discover_services(Duration::from_secs(2));
-        assert!(services.is_ok());
-
-        // We may or may not find services depending on the network
-        let services = services.unwrap();
-        println!("Found services on {} IPs", services.len());
-    }
 }

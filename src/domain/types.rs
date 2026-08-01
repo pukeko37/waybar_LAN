@@ -5,7 +5,7 @@
 //! - Validation happens at construction time
 //! - Invalid states are unrepresentable
 
-use anyhow::{Context, Result};
+use crate::domain::error::NetworkError;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::IpAddr;
@@ -18,26 +18,24 @@ pub struct MacAddress(String);
 impl MacAddress {
     /// Creates a new MacAddress from a string
     /// Accepts formats: AA:BB:CC:DD:EE:FF, aa:bb:cc:dd:ee:ff, AA-BB-CC-DD-EE-FF
-    pub fn new(mac: String) -> Result<Self> {
+    pub fn new(mac: String) -> Result<Self, NetworkError> {
         let normalized = mac.to_uppercase().replace('-', ":");
 
         // Basic validation: should be 17 chars with colons
         if normalized.len() != 17 {
-            anyhow::bail!("Invalid MAC address length: {}", mac);
+            return Err(NetworkError::InvalidMacLength(mac));
         }
 
         let parts: Vec<&str> = normalized.split(':').collect();
         if parts.len() != 6 {
-            anyhow::bail!("Invalid MAC address format: {}", mac);
+            return Err(NetworkError::InvalidMacFormat(mac));
         }
 
         // Validate each octet is valid hex
-        for part in parts {
-            if part.len() != 2 {
-                anyhow::bail!("Invalid MAC address octet: {}", part);
+        for part in &parts {
+            if part.len() != 2 || u8::from_str_radix(part, 16).is_err() {
+                return Err(NetworkError::InvalidMacOctet((*part).to_string()));
             }
-            u8::from_str_radix(part, 16)
-                .context(format!("Invalid hex in MAC address: {}", part))?;
         }
 
         Ok(Self(normalized))
@@ -224,7 +222,7 @@ pub enum NeighborState {
 
 impl NeighborState {
     /// Parse neighbor state from ip neigh show output
-    pub fn from_str(s: &str) -> Self {
+    pub fn from_label(s: &str) -> Self {
         match s.to_uppercase().as_str() {
             "REACHABLE" => Self::Reachable,
             "STALE" => Self::Stale,
@@ -261,22 +259,6 @@ impl ActivityStatus {
         } else {
             Self::Stale
         }
-    }
-
-    /// Get Pango markup for coloring text
-    pub fn pango_color(&self) -> (&'static str, &'static str) {
-        match self {
-            Self::Active => ("<span color='#00FF00'>", "</span>"),   // Green
-            Self::Recent => ("<span color='#FFFF00'>", "</span>"),   // Yellow
-            Self::Idle => ("", ""),                                   // White (default)
-            Self::Stale => ("<span color='#888888'>", "</span>"),    // Grey
-        }
-    }
-
-    /// Wrap text with color markup based on activity status
-    pub fn colorize(&self, text: &str) -> String {
-        let (start, end) = self.pango_color();
-        format!("{}{}{}", start, text, end)
     }
 }
 
@@ -332,22 +314,6 @@ impl DeviceType {
             Self::Unknown => "Device",
         }
     }
-
-    pub fn as_emoji(&self) -> &'static str {
-        match self {
-            Self::Television => "📺",
-            Self::Printer => "🖨 ",      // Extra space for alignment
-            Self::Router => "🌐",
-            Self::Computer => "💻",
-            Self::NAS => "🗄",
-            Self::MobileDevice => "📞",  // Telephone receiver for phones
-            Self::Tablet => "📋",        // Clipboard for tablets
-            Self::Speaker => "🔊",
-            Self::StreamingDevice => "📺",
-            Self::SmartHome => "🏠",
-            Self::Unknown => "🖥 ",      // Extra space for alignment
-        }
-    }
 }
 
 impl fmt::Display for DeviceType {
@@ -376,26 +342,6 @@ impl DeviceIdentity {
             manufacturer: None,
             model: None,
             friendly_name: None,
-        }
-    }
-
-    /// Format device name with emoji and available information
-    /// Format: {Emoji} {Manufacturer} {Model} or {Emoji} {FriendlyName} or just {Emoji}
-    pub fn format(&self) -> String {
-        let emoji = self.device_type.as_emoji();
-
-        match (&self.manufacturer, &self.model) {
-            (Some(mfr), Some(model)) => format!("{} {} {}", emoji, mfr.as_str(), model.as_str()),
-            (Some(mfr), None) => format!("{} {}", emoji, mfr.as_str()),
-            (None, Some(model)) => format!("{} {}", emoji, model.as_str()),
-            (None, None) => {
-                if let Some(name) = &self.friendly_name {
-                    format!("{} {}", emoji, name.as_str())
-                } else {
-                    // Add device type name as fallback
-                    format!("{} {}", emoji, self.device_type.as_str())
-                }
-            }
         }
     }
 }
@@ -570,7 +516,7 @@ impl NetworkDevice {
                 if hostname_lower.contains(mfr) {
                     // Capitalize first letter
                     let capitalized = format!("{}{}",
-                        &mfr[0..1].to_uppercase(),
+                        mfr[0..1].to_uppercase(),
                         &mfr[1..]);
                     return Some(ManufacturerName::new(capitalized));
                 }

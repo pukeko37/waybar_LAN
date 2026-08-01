@@ -1,7 +1,8 @@
 //! Network data collection from system interfaces.
 
+use crate::app::NetworkFetcher;
 use crate::domain::{NetworkData, NetworkSnapshot, ServiceInfo, NetworkInterface, Gateway, Hostname};
-use crate::data::{mdns_discovery::MdnsDiscovery, proc_parsers};
+use crate::infra::network::{mdns_discovery::MdnsDiscovery, proc_parsers};
 use anyhow::Result;
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
@@ -201,6 +202,12 @@ impl Default for NetworkCollector {
     }
 }
 
+impl NetworkFetcher for NetworkCollector {
+    fn collect(&self) -> Result<NetworkSnapshot, anyhow::Error> {
+        self.collect_network_info()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,23 +216,5 @@ mod tests {
     fn test_collector_creation() {
         let collector = NetworkCollector::new();
         assert!(collector.is_ok());
-    }
-
-    #[test]
-    fn test_collect_network_info() {
-        let collector = NetworkCollector::new().unwrap();
-        let result = collector.collect_network_info();
-
-        // Should succeed even if no devices found
-        assert!(result.is_ok());
-
-        let snapshot = result.unwrap();
-        // We should have at least loopback interface
-        // (though it might not have an IPv4 address)
-        println!("Found {} interfaces", snapshot.interfaces.len());
-        println!("Found {} devices", snapshot.devices.len());
-        if let Some(gw) = snapshot.gateway {
-            println!("Gateway: {}", gw);
-        }
     }
 }

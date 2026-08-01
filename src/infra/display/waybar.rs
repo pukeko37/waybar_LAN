@@ -1,6 +1,7 @@
 //! Waybar JSON output formatting for network data.
 
-use crate::domain::NetworkData;
+use crate::app::NetworkFormatter;
+use crate::domain::{ActivityStatus, DeviceIdentity, DeviceType, NetworkData};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +18,59 @@ pub struct WaybarOutput {
     pub percentage: Option<u8>,
 }
 
+/// Get Pango markup for coloring text based on activity status
+fn pango_color(status: ActivityStatus) -> (&'static str, &'static str) {
+    match status {
+        ActivityStatus::Active => ("<span color='#00FF00'>", "</span>"), // Green
+        ActivityStatus::Recent => ("<span color='#FFFF00'>", "</span>"), // Yellow
+        ActivityStatus::Idle => ("", ""),                                // White (default)
+        ActivityStatus::Stale => ("<span color='#888888'>", "</span>"), // Grey
+    }
+}
+
+/// Wrap text with color markup based on activity status
+fn colorize(status: ActivityStatus, text: &str) -> String {
+    let (start, end) = pango_color(status);
+    format!("{}{}{}", start, text, end)
+}
+
+/// Emoji for a device type
+fn device_type_emoji(device_type: DeviceType) -> &'static str {
+    match device_type {
+        DeviceType::Television => "📺",
+        DeviceType::Printer => "🖨 ",     // Extra space for alignment
+        DeviceType::Router => "🌐",
+        DeviceType::Computer => "💻",
+        DeviceType::NAS => "🗄",
+        DeviceType::MobileDevice => "📞", // Telephone receiver for phones
+        DeviceType::Tablet => "📋",       // Clipboard for tablets
+        DeviceType::Speaker => "🔊",
+        DeviceType::StreamingDevice => "📺",
+        DeviceType::SmartHome => "🏠",
+        DeviceType::Unknown => "🖥 ",     // Extra space for alignment
+    }
+}
+
+/// Format device identity with emoji and available information
+/// Format: {Emoji} {Manufacturer} {Model} or {Emoji} {FriendlyName} or just {Emoji}
+fn format_identity(identity: &DeviceIdentity) -> String {
+    let emoji = device_type_emoji(identity.device_type);
+
+    match (&identity.manufacturer, &identity.model) {
+        (Some(mfr), Some(model)) => format!("{} {} {}", emoji, mfr.as_str(), model.as_str()),
+        (Some(mfr), None) => format!("{} {}", emoji, mfr.as_str()),
+        (None, Some(model)) => format!("{} {}", emoji, model.as_str()),
+        (None, None) => {
+            if let Some(name) = &identity.friendly_name {
+                format!("{} {}", emoji, name.as_str())
+            } else {
+                // Add device type name as fallback
+                format!("{} {}", emoji, identity.device_type.as_str())
+            }
+        }
+    }
+}
+
 /// Formats network data as Waybar JSON
 pub struct WaybarFormatter;
 
@@ -24,38 +78,6 @@ impl WaybarFormatter {
     /// Creates a new WaybarFormatter instance
     pub fn new() -> Self {
         Self
-    }
-
-    /// Formats network data for Waybar display
-    pub fn format(&self, network_data: &NetworkData) -> Result<WaybarOutput> {
-        let device_count = network_data.devices.len();
-
-        // Main text: device count
-        let text = if device_count == 0 {
-            "🖧 No devices".to_string()
-        } else if device_count == 1 {
-            "🖧 1 device".to_string()
-        } else {
-            format!("🖧 {} devices", device_count)
-        };
-
-        // Build tooltip with tree structure
-        let tooltip = self.build_tooltip(network_data);
-
-        // CSS classes based on state
-        let classes = if device_count > 0 {
-            vec!["network".to_string(), "active".to_string()]
-        } else {
-            vec!["network".to_string()]
-        };
-
-        Ok(WaybarOutput {
-            text,
-            tooltip,
-            alt: Some("network".to_string()),
-            class: Some(classes),
-            percentage: None,
-        })
     }
 
     /// Builds the tooltip with tree structure
@@ -117,8 +139,8 @@ impl WaybarFormatter {
         let prefix = if is_last { "  └─ " } else { "  ├─ " };
 
         // Main device line
-        let display_name = device.identity.format();
-        let colored_name = device.activity_status().colorize(&display_name);
+        let display_name = format_identity(&device.identity);
+        let colored_name = colorize(device.activity_status(), &display_name);
         lines.push(format!("{}{} ({})", prefix, colored_name, device.ip));
 
         // Services
@@ -221,6 +243,42 @@ impl WaybarFormatter {
             class: Some(vec!["error".to_string()]),
             percentage: None,
         }
+    }
+}
+
+impl NetworkFormatter for WaybarFormatter {
+    type Output = WaybarOutput;
+
+    /// Formats network data for Waybar display
+    fn format(&self, network_data: &NetworkData) -> Result<WaybarOutput> {
+        let device_count = network_data.devices.len();
+
+        // Main text: device count
+        let text = if device_count == 0 {
+            "🖧 No devices".to_string()
+        } else if device_count == 1 {
+            "🖧 1 device".to_string()
+        } else {
+            format!("🖧 {} devices", device_count)
+        };
+
+        // Build tooltip with tree structure
+        let tooltip = self.build_tooltip(network_data);
+
+        // CSS classes based on state
+        let classes = if device_count > 0 {
+            vec!["network".to_string(), "active".to_string()]
+        } else {
+            vec!["network".to_string()]
+        };
+
+        Ok(WaybarOutput {
+            text,
+            tooltip,
+            alt: Some("network".to_string()),
+            class: Some(classes),
+            percentage: None,
+        })
     }
 }
 

@@ -1,10 +1,12 @@
 //! Display module for formatting network data as Waybar JSON output.
+//! Presentation-only: owns colour/emoji selection, implements `app::NetworkFormatter`.
 pub mod waybar;
 pub use waybar::*;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::NetworkFormatter;
     use crate::domain::NetworkData;
 
     #[test]
