@@ -6,10 +6,11 @@
 
 use anyhow::Result;
 use std::path::PathBuf;
-use waybar_lan::app::{NetworkFetcher, NetworkFormatter};
+use waybar_lan::app::{merge_network_and_router, NetworkFetcher, NetworkFormatter, RouterFetcher};
 use waybar_lan::infra::display::WaybarFormatter;
 use waybar_lan::infra::dump;
 use waybar_lan::infra::network::NetworkCollector;
+use waybar_lan::infra::router::SshRouterFetcher;
 
 /// Configuration parsed from command line arguments
 struct Config {
@@ -66,6 +67,11 @@ fn print_help() {
     println!("    --sanitize             Sanitize IPs and MACs when dumping (use with --dump-devices)");
     println!("    -h, --help             Print this help message");
     println!();
+    println!("ENVIRONMENT:");
+    println!("    WAYBAR_LAN_ROUTER      user@host for an OpenWrt router to merge as a second");
+    println!("                           device source (e.g. andrew@192.168.1.1). Unset by");
+    println!("                           default: no router fetch is attempted.");
+    println!();
     println!("EXAMPLES:");
     println!("    waybar_lan                                    # Normal operation");
     println!("    waybar_lan --dump-devices /tmp/devices        # Dump device data");
@@ -116,6 +122,17 @@ fn main() -> Result<()> {
             // Include fallback for absolute safety
             collector.collect()
         });
+
+    // Router presence is binary: unset WAYBAR_LAN_ROUTER is a zero-behavioural-change
+    // path (no SSH attempted); set-but-unreachable is a full collection failure, not a
+    // silent fallback to local-only data.
+    let network_data = network_data.and_then(|data| match std::env::var("WAYBAR_LAN_ROUTER") {
+        Ok(host) => {
+            let router_snapshot = SshRouterFetcher::new(host).collect()?;
+            Ok(merge_network_and_router(data, router_snapshot))
+        }
+        Err(_) => Ok(data),
+    });
 
     match network_data {
         Ok(data) => {

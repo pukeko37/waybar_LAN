@@ -352,13 +352,124 @@ impl Default for DeviceIdentity {
     }
 }
 
-/// Network device discovered on the LAN
+/// A WireGuard peer's public key. WireGuard peers have no MAC address (a
+/// WireGuard tunnel is Layer-3-only — there is no Ethernet frame to carry
+/// one), so this is the strongest identity/correlation signal available for
+/// them, per [[device-catalogue-identity]].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct WireGuardPublicKey(String);
+
+impl WireGuardPublicKey {
+    pub fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for WireGuardPublicKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Device identity: a priority-ordered choice of the strongest signal
+/// available, not a raw address. `Mac` > `WireGuardKey` > `Hostname` > `Ip`
+/// as a last resort — the same "strongest available signal wins" idea
+/// [[app-module-rules]] already applies to per-field merge priority, now
+/// applied to identity itself. See [[device-catalogue-identity]], which
+/// superseded the earlier `DeviceId(IpAddr)` design: keying identity on one
+/// specific address meant a device with more than one address (dual-homed
+/// via LAN and WireGuard, or simply IPv6 SLAAC/link-local/temporary
+/// addresses alongside an IPv4 one) rendered as multiple devices.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DeviceId {
+    Mac(MacAddress),
+    WireGuardKey(WireGuardPublicKey),
+    Hostname(String),
+    Ip(IpAddr),
+}
+
+/// One address a device is reachable at, plus which of *this host's own*
+/// interfaces it was seen on locally (`None` for a router-only address —
+/// there is no local NIC to attribute it to).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceAddress {
+    pub ip: IpAddr,
+    pub interface_name: Option<InterfaceName>,
+}
+
+/// A partial per-address record contributed by one data source (local
+/// collection or the router), consumed by `app`'s merge fold. Every field
+/// but `ip` is optional — a source reports what it happens to know.
+/// Grouped first by exact `ip` (the same address genuinely is the same
+/// address), then correlated across different addresses of the same
+/// physical device via `mac`/`wireguard_public_key`/`hostname` — see
+/// [[device-catalogue-identity]].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceObservation {
+    pub ip: IpAddr,
+    pub mac: Option<MacAddress>,
+    pub hostname: Option<String>,
+    pub friendly_name: Option<FriendlyName>,
+    pub interface_name: Option<InterfaceName>,
+    pub neighbor_state: Option<NeighborState>,
+    pub wireguard_public_key: Option<WireGuardPublicKey>,
+}
+
+impl DeviceObservation {
+    /// A bare observation carrying only its address — enrichment fields are
+    /// filled in with builder-style `with_*` calls as a source reports them.
+    pub fn new(ip: IpAddr) -> Self {
+        Self {
+            ip,
+            mac: None,
+            hostname: None,
+            friendly_name: None,
+            interface_name: None,
+            neighbor_state: None,
+            wireguard_public_key: None,
+        }
+    }
+
+    pub fn with_mac(mut self, mac: MacAddress) -> Self {
+        self.mac = Some(mac);
+        self
+    }
+
+    pub fn with_hostname(mut self, hostname: String) -> Self {
+        self.hostname = Some(hostname);
+        self
+    }
+
+    pub fn with_friendly_name(mut self, friendly_name: FriendlyName) -> Self {
+        self.friendly_name = Some(friendly_name);
+        self
+    }
+
+    pub fn with_neighbor_state(mut self, neighbor_state: NeighborState) -> Self {
+        self.neighbor_state = Some(neighbor_state);
+        self
+    }
+
+    pub fn with_wireguard_public_key(mut self, key: WireGuardPublicKey) -> Self {
+        self.wireguard_public_key = Some(key);
+        self
+    }
+}
+
+/// Network device discovered on the LAN — a catalogue entry, not an
+/// address. May be reachable at more than one `DeviceAddress` (dual-homed
+/// via two local interfaces, or multiple IPv6 addresses alongside an IPv4
+/// one); see [[device-catalogue-identity]].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkDevice {
-    pub ip: IpAddr,
-    pub mac: MacAddress,
+    pub id: DeviceId,
+    pub addresses: Vec<DeviceAddress>,
+    pub mac: Option<MacAddress>,
     pub hostname: Hostname,
-    pub interface_name: InterfaceName,
     pub services: Vec<ServiceInfo>,
     pub last_seen: SystemTime,
     pub neighbor_state: NeighborState,
@@ -366,17 +477,32 @@ pub struct NetworkDevice {
 }
 
 impl NetworkDevice {
-    pub fn new(ip: IpAddr, mac: MacAddress, interface_name: InterfaceName) -> Self {
+    pub fn new(id: DeviceId, addresses: Vec<DeviceAddress>, mac: Option<MacAddress>) -> Self {
         Self {
-            ip,
+            id,
+            addresses,
             mac,
             hostname: Hostname::Resolving,
-            interface_name,
             services: Vec::new(),
             last_seen: SystemTime::now(),
             neighbor_state: NeighborState::Unknown,
             identity: DeviceIdentity::new(),
         }
+    }
+
+    /// This device's primary/display address: first IPv4 address, else the
+    /// first address of any kind.
+    ///
+    /// Safety: `addresses` is never empty — every `NetworkDevice` is built
+    /// from at least one clustered address (see `app::merge_network_and_router`)
+    /// or one DTO-derived address (see `infra::network::models`).
+    pub fn primary_address(&self) -> IpAddr {
+        self.addresses
+            .iter()
+            .find(|a| a.ip.is_ipv4())
+            .or_else(|| self.addresses.first())
+            .map(|a| a.ip)
+            .expect("NetworkDevice always has at least one address")
     }
 
     /// Get activity status based on neighbor state and last seen time
@@ -607,15 +733,6 @@ impl NetworkSnapshot {
         }
     }
 
-    /// Groups devices by their interface name
-    pub fn devices_by_interface(&self) -> std::collections::HashMap<InterfaceName, Vec<&NetworkDevice>> {
-        self.devices.iter().fold(std::collections::HashMap::new(), |mut map, device| {
-            map.entry(device.interface_name.clone())
-                .or_default()
-                .push(device);
-            map
-        })
-    }
 }
 
 // For backward compatibility with existing code
@@ -685,11 +802,71 @@ mod tests {
     fn test_network_device_creation() {
         let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
         let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
-        let device = NetworkDevice::new(ip, mac, InterfaceName::new("eth0".to_string()));
+        let address = DeviceAddress { ip, interface_name: Some(InterfaceName::new("eth0".to_string())) };
+        let device = NetworkDevice::new(DeviceId::Mac(mac.clone()), vec![address], Some(mac));
 
-        assert_eq!(device.ip, ip);
-        assert_eq!(device.interface_name, InterfaceName::new("eth0".to_string()));
+        assert_eq!(device.primary_address(), ip);
+        assert_eq!(device.addresses[0].interface_name, Some(InterfaceName::new("eth0".to_string())));
         assert_eq!(device.hostname, Hostname::Resolving);
+    }
+
+    #[test]
+    fn test_network_device_mac_is_optional() {
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
+        let address = DeviceAddress { ip, interface_name: Some(InterfaceName::new("wg0".to_string())) };
+        let device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
+
+        assert_eq!(device.mac, None);
+        assert_eq!(device.id, DeviceId::Ip(ip));
+    }
+
+    #[test]
+    fn test_network_device_interface_name_is_optional_for_router_only_devices() {
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 5));
+        let address = DeviceAddress { ip, interface_name: None };
+        let device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
+
+        assert_eq!(device.addresses[0].interface_name, None);
+    }
+
+    #[test]
+    fn test_network_device_primary_address_prefers_ipv4() {
+        let ipv4 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let ipv6: IpAddr = "fe80::1".parse().unwrap();
+        let addresses = vec![
+            DeviceAddress { ip: ipv6, interface_name: None },
+            DeviceAddress { ip: ipv4, interface_name: None },
+        ];
+        let device = NetworkDevice::new(DeviceId::Ip(ipv4), addresses, None);
+
+        assert_eq!(device.primary_address(), ipv4);
+    }
+
+    #[test]
+    fn test_device_observation_starts_bare_and_builds_up() {
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
+        let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
+
+        let observation = DeviceObservation::new(ip)
+            .with_mac(mac.clone())
+            .with_hostname("phone.lan".to_string());
+
+        assert_eq!(observation.ip, ip);
+        assert_eq!(observation.mac, Some(mac));
+        assert_eq!(observation.hostname, Some("phone.lan".to_string()));
+        assert_eq!(observation.friendly_name, None);
+        assert_eq!(observation.neighbor_state, None);
+        assert_eq!(observation.wireguard_public_key, None);
+    }
+
+    #[test]
+    fn test_device_observation_with_wireguard_public_key() {
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
+        let key = WireGuardPublicKey::new("gN4DvXs=".to_string());
+
+        let observation = DeviceObservation::new(ip).with_wireguard_public_key(key.clone());
+
+        assert_eq!(observation.wireguard_public_key, Some(key));
     }
 
     #[test]
@@ -697,28 +874,5 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
         let gateway = Gateway::new(ip);
         assert_eq!(format!("{}", gateway), "192.168.1.1");
-    }
-
-    #[test]
-    fn test_network_snapshot_devices_by_interface() {
-        let ip1 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
-        let ip2 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 51));
-        let mac1 = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
-        let mac2 = MacAddress::new("11:22:33:44:55:66".to_string()).unwrap();
-
-        let device1 = NetworkDevice::new(ip1, mac1, InterfaceName::new("eth0".to_string()));
-        let device2 = NetworkDevice::new(ip2, mac2, InterfaceName::new("wlan0".to_string()));
-
-        let snapshot = NetworkSnapshot::new(
-            vec![],
-            vec![device1, device2],
-            None,
-            vec![],
-        );
-
-        let by_interface = snapshot.devices_by_interface();
-        assert_eq!(by_interface.len(), 2);
-        assert_eq!(by_interface.get(&InterfaceName::new("eth0".to_string())).unwrap().len(), 1);
-        assert_eq!(by_interface.get(&InterfaceName::new("wlan0".to_string())).unwrap().len(), 1);
     }
 }

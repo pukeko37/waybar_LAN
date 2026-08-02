@@ -71,7 +71,7 @@ impl NetworkCollector {
         };
 
         // Perform reverse DNS lookups for all ARP devices
-        let device_ips: Vec<_> = arp_devices.iter().map(|d| d.ip).collect();
+        let device_ips: Vec<_> = arp_devices.iter().map(|d| d.primary_address()).collect();
         eprintln!("Performing reverse DNS lookups for {} IPs...", device_ips.len());
         let dns_lookups: HashMap<IpAddr, Hostname> = std::thread::scope(|s| {
             device_ips
@@ -131,7 +131,8 @@ impl NetworkCollector {
             (Vec::new(), std::collections::HashMap::new()),
             |(mut enriched, mut names), mut device| {
                 // Add mDNS services and extract instance name
-                if let Some(services) = mdns_services.get(&device.ip) {
+                let device_ip = device.primary_address();
+                if let Some(services) = mdns_services.get(&device_ip) {
                     device.services = services.clone();
                     device.update_last_seen();
 
@@ -140,7 +141,7 @@ impl NetworkCollector {
                         && let Some(hostname) = service.instance_name.as_str().split('.').next()
                         && !hostname.is_empty() && hostname != "_"
                     {
-                        names.insert(device.ip, hostname.to_string());
+                        names.insert(device_ip, hostname.to_string());
                     }
                 }
 
@@ -152,7 +153,7 @@ impl NetworkCollector {
         // Perform reverse DNS lookups in parallel and apply hostname priority logic
         // Priority: DNS > mDNS instance name > Unknown
         let devices = {
-            let device_ips: Vec<_> = devices.iter().map(|d| d.ip).collect();
+            let device_ips: Vec<_> = devices.iter().map(|d| d.primary_address()).collect();
 
             let dns_results: Vec<_> = std::thread::scope(|s| {
                 device_ips
@@ -173,7 +174,7 @@ impl NetworkCollector {
                     // Apply hostname priority logic: DNS > mDNS > Unknown
                     device.hostname = if let crate::domain::Hostname::Resolved(_) = dns_hostname {
                         dns_hostname
-                    } else if let Some(mdns_name) = mdns_names.get(&device.ip) {
+                    } else if let Some(mdns_name) = mdns_names.get(&device.primary_address()) {
                         crate::domain::Hostname::resolved(mdns_name.clone())
                     } else {
                         crate::domain::Hostname::Unknown

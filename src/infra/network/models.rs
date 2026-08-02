@@ -1,7 +1,7 @@
 //! Data Transfer Objects mirroring the raw system data shapes, converted
 //! to domain types via `TryFrom`/`From` rather than constructed directly.
 
-use crate::domain::{InterfaceName, MacAddress, NeighborState, NetworkDevice, NetworkError, NetworkInterface};
+use crate::domain::{DeviceAddress, DeviceId, InterfaceName, MacAddress, NeighborState, NetworkDevice, NetworkError, NetworkInterface};
 use std::net::IpAddr;
 
 /// One parsed line from `ip neigh show`.
@@ -18,7 +18,8 @@ impl TryFrom<NeighborEntryDto> for NetworkDevice {
 
     fn try_from(dto: NeighborEntryDto) -> Result<Self, Self::Error> {
         let mac = MacAddress::new(dto.mac)?;
-        let mut device = NetworkDevice::new(dto.ip, mac, InterfaceName::new(dto.interface));
+        let address = DeviceAddress { ip: dto.ip, interface_name: Some(InterfaceName::new(dto.interface)) };
+        let mut device = NetworkDevice::new(DeviceId::Mac(mac.clone()), vec![address], Some(mac));
         device.neighbor_state = NeighborState::from_label(&dto.state);
         Ok(device)
     }

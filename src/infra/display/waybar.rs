@@ -1,7 +1,7 @@
 //! Waybar JSON output formatting for network data.
 
 use crate::app::NetworkFormatter;
-use crate::domain::{ActivityStatus, DeviceIdentity, DeviceType, NetworkData};
+use crate::domain::{ActivityStatus, DeviceId, DeviceIdentity, DeviceType, NetworkData};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -80,26 +80,30 @@ impl WaybarFormatter {
         Self
     }
 
-    /// Builds the tooltip with tree structure
+    /// Builds the tooltip: a brief preamble listing this host's own local
+    /// interfaces (informational only, not a grouping mechanism — see
+    /// [[flat-device-list-display]]), followed by one flat device list
+    /// sorted by primary address. No per-interface or per-source grouping:
+    /// a multi-address device (dual-homed via two local interfaces, or
+    /// with several IPv6 addresses alongside an IPv4 one) renders as one
+    /// row, not one row per address.
     fn build_tooltip(&self, network_data: &NetworkData) -> String {
         if network_data.interfaces.is_empty() {
             return "No network interfaces found".to_string();
         }
 
-        let devices_by_interface = network_data.devices_by_interface();
-        let mut lines = Vec::new();
+        let mut lines: Vec<String> = network_data
+            .interfaces
+            .iter()
+            .map(|interface| self.format_interface_header(interface))
+            .collect();
+        lines.push(String::new());
 
-        for interface in &network_data.interfaces {
-            lines.push(self.format_interface_header(interface));
-
-            if let Some(devices) = devices_by_interface.get(&interface.name) {
-                let sorted_devices = self.sort_devices(devices);
-                lines.extend(self.format_devices(&sorted_devices, network_data));
-            } else {
-                lines.push("  └─ No devices".to_string());
-            }
-
-            lines.push(String::new()); // Empty line between interfaces
+        if network_data.devices.is_empty() {
+            lines.push("No devices".to_string());
+        } else {
+            let sorted_devices = self.sort_devices(&network_data.devices);
+            lines.extend(self.format_devices(&sorted_devices, network_data));
         }
 
         lines.join("\n").trim_end().to_string()
@@ -114,15 +118,15 @@ impl WaybarFormatter {
         }
     }
 
-    /// Sort devices by IP address
-    fn sort_devices<'a>(&self, devices: &[&'a crate::domain::NetworkDevice])
+    /// Sort devices by primary address (IPv4-preferred).
+    fn sort_devices<'a>(&self, devices: &'a [crate::domain::NetworkDevice])
         -> Vec<&'a crate::domain::NetworkDevice> {
-        let mut sorted = devices.to_vec();
-        sorted.sort_by_key(|d| d.ip);
+        let mut sorted: Vec<&crate::domain::NetworkDevice> = devices.iter().collect();
+        sorted.sort_by_key(|d| d.primary_address());
         sorted
     }
 
-    /// Format all devices for an interface
+    /// Format all devices in the flat list
     fn format_devices(&self, devices: &[&crate::domain::NetworkDevice], network_data: &NetworkData)
         -> Vec<String> {
         let device_count = devices.len();
@@ -130,6 +134,21 @@ impl WaybarFormatter {
             let is_last = i == device_count - 1;
             self.format_device_entry(device, is_last, network_data)
         }).collect()
+    }
+
+    /// Inline access-path annotation replacing section placement — e.g.
+    /// `via eno1` when a `DeviceAddress` carries a local `interface_name`,
+    /// `via WireGuard` when only a WireGuard-key-correlated address is
+    /// known. No heuristic guessing beyond what the device's own fields
+    /// state directly, per [[flat-device-list-display]].
+    fn access_path_annotation(&self, device: &crate::domain::NetworkDevice) -> Option<String> {
+        if let Some(name) = device.addresses.iter().find_map(|a| a.interface_name.as_ref()) {
+            return Some(format!("via {}", name));
+        }
+        if matches!(device.id, DeviceId::WireGuardKey(_)) {
+            return Some("via WireGuard".to_string());
+        }
+        None
     }
 
     /// Format a single device entry with its services and gateway info
@@ -141,7 +160,11 @@ impl WaybarFormatter {
         // Main device line
         let display_name = format_identity(&device.identity);
         let colored_name = colorize(device.activity_status(), &display_name);
-        lines.push(format!("{}{} ({})", prefix, colored_name, device.ip));
+        let location = match self.access_path_annotation(device) {
+            Some(annotation) => format!("{}, {}", device.primary_address(), annotation),
+            None => device.primary_address().to_string(),
+        };
+        lines.push(format!("{}{} ({})", prefix, colored_name, location));
 
         // Services
         if let Some(services_line) = self.format_services(device, is_last) {
@@ -181,7 +204,7 @@ impl WaybarFormatter {
         use std::net::IpAddr;
 
         let Some(gateway) = network_data.gateway else { return Vec::new() };
-        if device.ip != gateway.0 {
+        if !device.addresses.iter().any(|a| a.ip == gateway.0) {
             return Vec::new();
         }
 
@@ -319,6 +342,14 @@ mod tests {
         assert!(!output.tooltip.is_empty());
     }
 
+    fn local_device(ip: IpAddr, mac: MacAddress, interface: &str) -> NetworkDevice {
+        let address = crate::domain::DeviceAddress {
+            ip,
+            interface_name: Some(crate::domain::InterfaceName::new(interface.to_string())),
+        };
+        NetworkDevice::new(crate::domain::DeviceId::Mac(mac.clone()), vec![address], Some(mac))
+    }
+
     #[test]
     fn test_format_with_devices() {
         let formatter = WaybarFormatter::new();
@@ -331,8 +362,8 @@ mod tests {
         let mac3 = MacAddress::new("00:11:22:33:44:55".to_string()).unwrap();
 
         let interface = NetworkInterface::new(crate::domain::InterfaceName::new("eth0".to_string()), ip1, Some(mac1.clone()));
-        let device = NetworkDevice::new(ip2, mac2, crate::domain::InterfaceName::new("eth0".to_string()));
-        let mut router = NetworkDevice::new(gateway_ip, mac3, crate::domain::InterfaceName::new("eth0".to_string()));
+        let device = local_device(ip2, mac2, "eth0");
+        let mut router = local_device(gateway_ip, mac3, "eth0");
         router.build_identity(); // Build identity so it shows as "Router"
 
         let gateway = Gateway::new(gateway_ip);
@@ -345,5 +376,66 @@ mod tests {
         assert!(output.tooltip.contains("192.168.1.50"));
         assert!(output.tooltip.contains("192.168.1.1"));
         assert!(output.tooltip.contains("Gateway"));
+    }
+
+    #[test]
+    fn test_format_annotates_device_with_local_interface() {
+        let formatter = WaybarFormatter::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
+        let interface = NetworkInterface::new(crate::domain::InterfaceName::new("eth0".to_string()), ip, Some(mac.clone()));
+        let device = local_device(ip, mac, "eth0");
+
+        let data = NetworkData::new(vec![interface], vec![device], None, vec![]);
+        let output = formatter.format(&data).unwrap();
+
+        assert!(output.tooltip.contains("via eth0"));
+    }
+
+    #[test]
+    fn test_format_renders_router_only_device_annotated_via_wireguard() {
+        let formatter = WaybarFormatter::new();
+        let local_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let local_mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
+        let interface = NetworkInterface::new(crate::domain::InterfaceName::new("eth0".to_string()), local_ip, Some(local_mac.clone()));
+        let local = local_device(local_ip, local_mac, "eth0");
+
+        // A WireGuard peer with no local presence: no mac, no interface_name,
+        // identified only by its WireGuard public key.
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
+        let key = crate::domain::WireGuardPublicKey::new("pubkey123".to_string());
+        let peer_address = crate::domain::DeviceAddress { ip: peer_ip, interface_name: None };
+        let peer = NetworkDevice::new(crate::domain::DeviceId::WireGuardKey(key), vec![peer_address], None);
+
+        let data = NetworkData::new(vec![interface], vec![local, peer], None, vec![]);
+        let output = formatter.format(&data).unwrap();
+
+        assert_eq!(output.text, "🖧 2 devices");
+        assert!(output.tooltip.contains("10.20.30.3"));
+        assert!(output.tooltip.contains("via WireGuard"));
+    }
+
+    #[test]
+    fn test_format_collapses_dual_homed_device_to_one_tooltip_row() {
+        let formatter = WaybarFormatter::new();
+        let lan_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let wg_ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
+        let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
+
+        let interface = NetworkInterface::new(crate::domain::InterfaceName::new("eth0".to_string()), lan_ip, Some(mac.clone()));
+        let addresses = vec![
+            crate::domain::DeviceAddress { ip: lan_ip, interface_name: Some(crate::domain::InterfaceName::new("eth0".to_string())) },
+            crate::domain::DeviceAddress { ip: wg_ip, interface_name: None },
+        ];
+        let device = NetworkDevice::new(crate::domain::DeviceId::Mac(mac.clone()), addresses, Some(mac));
+
+        let data = NetworkData::new(vec![interface], vec![device], None, vec![]);
+        let output = formatter.format(&data).unwrap();
+
+        // One device, one row — the badge count and the number of tree
+        // glyphs ("├─"/"└─") in the tooltip must agree.
+        assert_eq!(output.text, "🖧 1 device");
+        let row_count = output.tooltip.matches("└─").count() + output.tooltip.matches("├─").count();
+        assert_eq!(row_count, 1);
     }
 }
