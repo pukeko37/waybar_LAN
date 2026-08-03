@@ -265,6 +265,7 @@ fn build_device(
 
     let friendly_name = flattened.iter().find_map(|(_, o)| o.friendly_name.clone());
     let neighbor_state = flattened.iter().find_map(|(_, o)| o.neighbor_state);
+    let wireguard_latest_handshake = flattened.iter().find_map(|(_, o)| o.wireguard_latest_handshake);
 
     let id = match (&mac, &wireguard_public_key, &hostname) {
         (Some(mac), _, _) => DeviceId::Mac(mac.clone()),
@@ -294,6 +295,7 @@ fn build_device(
     if let Some(state) = neighbor_state {
         device.neighbor_state = state;
     }
+    device.wireguard_latest_handshake = wireguard_latest_handshake;
 
     device.build_identity();
     if let Some(friendly_name) = friendly_name {
@@ -413,6 +415,29 @@ mod tests {
         assert_eq!(device.id, DeviceId::WireGuardKey(WireGuardPublicKey::new("pubkey123".to_string())));
         assert!(device.addresses.iter().all(|a| a.interface_name.is_none()));
         assert_eq!(device.identity.friendly_name, Some(FriendlyName::new("Jamie phone".to_string())));
+    }
+
+    #[test]
+    fn test_merge_carries_wireguard_latest_handshake_onto_device() {
+        let ip: IpAddr = "10.20.30.3".parse().unwrap();
+        let local = NetworkSnapshot::new(vec![], vec![], None, vec![]);
+        let handshake = std::time::SystemTime::now() - std::time::Duration::from_secs(30);
+
+        let router = RouterSnapshot {
+            observations: vec![TieredObservation {
+                tier: RouterSourceTier::WireGuard,
+                observation: DeviceObservation::new(ip)
+                    .with_wireguard_public_key(WireGuardPublicKey::new("pubkey123".to_string()))
+                    .with_wireguard_latest_handshake(handshake),
+            }],
+            wifi_clients: vec![],
+            wan_address: None,
+        };
+
+        let merged = merge_network_and_router(local, router);
+        assert_eq!(merged.devices.len(), 1);
+        assert_eq!(merged.devices[0].wireguard_latest_handshake, Some(handshake));
+        assert_eq!(merged.devices[0].activity_status(), crate::domain::ActivityStatus::Active);
     }
 
     #[test]

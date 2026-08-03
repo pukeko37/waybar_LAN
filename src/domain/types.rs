@@ -260,6 +260,24 @@ impl ActivityStatus {
             Self::Stale
         }
     }
+
+    /// Activity status for a WireGuard peer, from its tunnel's latest
+    /// handshake time — a plain two-way split, `Active` within the last
+    /// hour else `Stale`, deliberately not the four-tier `from_last_seen`
+    /// scheme: "minutes since last poll noticed you" isn't meaningful for
+    /// a tunnel peer the way it is for a freshly-discovered LAN device. See
+    /// [[wireguard-handshake-activity]].
+    pub fn from_wireguard_handshake(latest_handshake: SystemTime) -> Self {
+        let elapsed = SystemTime::now()
+            .duration_since(latest_handshake)
+            .unwrap_or(Duration::from_secs(0));
+
+        if elapsed < Duration::from_secs(3600) {
+            Self::Active
+        } else {
+            Self::Stale
+        }
+    }
 }
 
 impl Hostname {
@@ -417,6 +435,10 @@ pub struct DeviceObservation {
     pub interface_name: Option<InterfaceName>,
     pub neighbor_state: Option<NeighborState>,
     pub wireguard_public_key: Option<WireGuardPublicKey>,
+    /// A WireGuard peer's last handshake time, per [[wireguard-handshake-activity]]
+    /// — `None` means no handshake has ever been reported (including
+    /// `wg-dump`'s "never handshaked" `0` sentinel), not "unknown".
+    pub wireguard_latest_handshake: Option<SystemTime>,
 }
 
 impl DeviceObservation {
@@ -431,6 +453,7 @@ impl DeviceObservation {
             interface_name: None,
             neighbor_state: None,
             wireguard_public_key: None,
+            wireguard_latest_handshake: None,
         }
     }
 
@@ -458,6 +481,11 @@ impl DeviceObservation {
         self.wireguard_public_key = Some(key);
         self
     }
+
+    pub fn with_wireguard_latest_handshake(mut self, latest_handshake: SystemTime) -> Self {
+        self.wireguard_latest_handshake = Some(latest_handshake);
+        self
+    }
 }
 
 /// Network device discovered on the LAN — a catalogue entry, not an
@@ -474,6 +502,9 @@ pub struct NetworkDevice {
     pub last_seen: SystemTime,
     pub neighbor_state: NeighborState,
     pub identity: DeviceIdentity,
+    /// See [[wireguard-handshake-activity]] — `Some` overrides `activity_status()`'s
+    /// usual `neighbor_state`/`last_seen`-based calculation.
+    pub wireguard_latest_handshake: Option<SystemTime>,
 }
 
 impl NetworkDevice {
@@ -487,6 +518,7 @@ impl NetworkDevice {
             last_seen: SystemTime::now(),
             neighbor_state: NeighborState::Unknown,
             identity: DeviceIdentity::new(),
+            wireguard_latest_handshake: None,
         }
     }
 
@@ -505,9 +537,18 @@ impl NetworkDevice {
             .expect("NetworkDevice always has at least one address")
     }
 
-    /// Get activity status based on neighbor state and last seen time
-    /// Prioritizes kernel neighbor table state over time-based calculation
+    /// Get activity status. A WireGuard peer's `wireguard_latest_handshake`,
+    /// when present, takes priority over `neighbor_state`/`last_seen` — see
+    /// [[wireguard-handshake-activity]]: WireGuard peers never appear in the
+    /// kernel neighbor table (`neighbor_state` is always `Unknown` for them),
+    /// and `last_seen` is reset to "now" on every poll's device rebuild, so
+    /// falling through to the time-based calculation always read `Active`
+    /// regardless of real tunnel activity.
     pub fn activity_status(&self) -> ActivityStatus {
+        if let Some(latest_handshake) = self.wireguard_latest_handshake {
+            return ActivityStatus::from_wireguard_handshake(latest_handshake);
+        }
+
         match self.neighbor_state {
             NeighborState::Reachable | NeighborState::Delay | NeighborState::Probe => {
                 ActivityStatus::Active
@@ -911,6 +952,52 @@ mod tests {
         let observation = DeviceObservation::new(ip).with_wireguard_public_key(key.clone());
 
         assert_eq!(observation.wireguard_public_key, Some(key));
+    }
+
+    #[test]
+    fn test_device_observation_with_wireguard_latest_handshake() {
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
+        let handshake = SystemTime::now() - Duration::from_secs(120);
+
+        let observation = DeviceObservation::new(ip).with_wireguard_latest_handshake(handshake);
+
+        assert_eq!(observation.wireguard_latest_handshake, Some(handshake));
+    }
+
+    #[test]
+    fn test_activity_status_from_wireguard_handshake_recent_is_active() {
+        let handshake = SystemTime::now() - Duration::from_secs(120);
+        assert_eq!(ActivityStatus::from_wireguard_handshake(handshake), ActivityStatus::Active);
+    }
+
+    #[test]
+    fn test_activity_status_from_wireguard_handshake_over_an_hour_is_stale() {
+        let handshake = SystemTime::now() - Duration::from_secs(3601);
+        assert_eq!(ActivityStatus::from_wireguard_handshake(handshake), ActivityStatus::Stale);
+    }
+
+    #[test]
+    fn test_network_device_activity_status_prefers_wireguard_handshake_over_stale_last_seen() {
+        // Regression test for the bug motivating [[wireguard-handshake-activity]]:
+        // a WireGuard peer's neighbor_state is always Unknown, and last_seen is
+        // effectively always "now" (reset on every poll's device rebuild), so
+        // without this override every peer always read as Active.
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
+        let address = DeviceAddress { ip, interface_name: None };
+        let mut device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
+        device.wireguard_latest_handshake = Some(SystemTime::now() - Duration::from_secs(7200));
+
+        assert_eq!(device.activity_status(), ActivityStatus::Stale);
+    }
+
+    #[test]
+    fn test_network_device_activity_status_wireguard_handshake_within_hour_is_active() {
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
+        let address = DeviceAddress { ip, interface_name: None };
+        let mut device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
+        device.wireguard_latest_handshake = Some(SystemTime::now() - Duration::from_secs(30));
+
+        assert_eq!(device.activity_status(), ActivityStatus::Active);
     }
 
     #[test]

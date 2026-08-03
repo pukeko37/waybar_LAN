@@ -7,6 +7,7 @@ use crate::domain::{
 };
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Waybar output format
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +36,54 @@ fn pango_color(status: ActivityStatus) -> (&'static str, &'static str) {
 fn colorize(status: ActivityStatus, text: &str) -> String {
     let (start, end) = pango_color(status);
     format!("{}{}{}", start, text, end)
+}
+
+/// This row's own tree glyph, per [[nested-tree-by-access-path]]'s nesting
+/// of the existing tree vocabulary one level deeper.
+fn tree_glyph(is_last: bool) -> &'static str {
+    if is_last { "└─ " } else { "├─ " }
+}
+
+/// The indent a row's children are drawn under — a continuing vertical bar
+/// when this row isn't the last in its list, plain space once it is.
+fn tree_continuation(is_last: bool) -> &'static str {
+    if is_last { "      " } else { "  │   " }
+}
+
+/// Splits a Unix day count into (year, month, day), proleptic Gregorian
+/// calendar. Howard Hinnant's `civil_from_days` algorithm — a closed-form
+/// calculation with no lookup tables — chosen per [[updated-timestamp-footer]]
+/// because [[waybar-lan-workspace-rules]] rules out the `time`/`chrono`
+/// crates `waybar_weather` uses for its equivalent "Updated:" footer, in
+/// favour of `std::time` alone.
+fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097); // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    let year = if month <= 2 { y + 1 } else { y };
+    (year, month, day)
+}
+
+/// Formats a `SystemTime` as `YYYY-MM-DD HH:MMZ` (UTC), matching the
+/// "Updated:" footer format `waybar_weather`'s `LastUpdated::format_display`
+/// produces, per [[updated-timestamp-footer]].
+fn format_utc_timestamp(time: SystemTime) -> String {
+    let total_secs = time
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    let days = total_secs.div_euclid(86400);
+    let secs_of_day = total_secs.rem_euclid(86400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = secs_of_day / 3600;
+    let minute = (secs_of_day % 3600) / 60;
+    format!("{:04}-{:02}-{:02} {:02}:{:02}Z", year, month, day, hour, minute)
 }
 
 /// Emoji for a device type
@@ -113,31 +162,32 @@ impl WaybarFormatter {
 
     /// Builds the tooltip: a brief preamble listing this host's own local
     /// interfaces (informational only, not a grouping mechanism — see
-    /// [[flat-device-list-display]]), followed by one flat device list
-    /// sorted by primary address. No per-interface or per-source grouping:
-    /// a multi-address device (dual-homed via two local interfaces, or
-    /// with several IPv6 addresses alongside an IPv4 one) renders as one
-    /// row, not one row per address.
+    /// [[flat-device-list-display]]), followed by a two-level device tree
+    /// grouped by access path (see [[nested-tree-by-access-path]]), and a
+    /// trailing "Updated:" timestamp footer (see [[updated-timestamp-footer]]).
     fn build_tooltip(&self, network_data: &NetworkData) -> String {
-        if network_data.interfaces.is_empty() {
-            return "No network interfaces found".to_string();
-        }
-
-        let mut lines: Vec<String> = network_data
-            .interfaces
-            .iter()
-            .map(|interface| self.format_interface_header(interface))
-            .collect();
-        lines.push(String::new());
-
-        if network_data.devices.is_empty() {
-            lines.push("No devices".to_string());
+        let body = if network_data.interfaces.is_empty() {
+            "No network interfaces found".to_string()
         } else {
-            let sorted_devices = self.sort_devices(&network_data.devices);
-            lines.extend(self.format_devices(&sorted_devices, network_data));
-        }
+            let mut lines: Vec<String> = network_data
+                .interfaces
+                .iter()
+                .map(|interface| self.format_interface_header(interface))
+                .collect();
+            lines.push(String::new());
 
-        lines.join("\n").trim_end().to_string()
+            if network_data.devices.is_empty() {
+                lines.push("No devices".to_string());
+            } else {
+                let sorted_devices = self.sort_devices(&network_data.devices);
+                let groups = self.group_devices_by_access_path(&sorted_devices);
+                lines.extend(self.format_groups(&groups, network_data));
+            }
+
+            lines.join("\n").trim_end().to_string()
+        };
+
+        format!("{}\n\n🕐 Updated: {}", body, format_utc_timestamp(SystemTime::now()))
     }
 
     /// Format interface header line
@@ -157,21 +207,57 @@ impl WaybarFormatter {
         sorted
     }
 
-    /// Format all devices in the flat list
-    fn format_devices(&self, devices: &[&crate::domain::NetworkDevice], network_data: &NetworkData)
-        -> Vec<String> {
-        let device_count = devices.len();
-        devices.iter().enumerate().flat_map(|(i, device)| {
-            let is_last = i == device_count - 1;
-            self.format_device_entry(device, is_last, network_data)
+    /// Groups already-sorted devices by `access_path_annotation`'s value
+    /// (`Other` when `None`), in first-appearance order — whichever group's
+    /// first member appears earliest in `devices` is first in the returned
+    /// list. Within each group, devices keep their existing relative order:
+    /// a stable partition of `devices`, not a re-sort. Per
+    /// [[nested-tree-by-access-path]].
+    fn group_devices_by_access_path<'a>(&self, devices: &[&'a crate::domain::NetworkDevice])
+        -> Vec<(String, Vec<&'a crate::domain::NetworkDevice>)> {
+        let mut groups: Vec<(String, Vec<&crate::domain::NetworkDevice>)> = Vec::new();
+        for &device in devices {
+            let heading = self.access_path_annotation(device).unwrap_or_else(|| "Other".to_string());
+            match groups.iter_mut().find(|(existing, _)| existing == &heading) {
+                Some((_, members)) => members.push(device),
+                None => groups.push((heading, vec![device])),
+            }
+        }
+        groups
+    }
+
+    /// Format every group as a heading line followed by its member devices,
+    /// nested one tree level deeper. Per [[nested-tree-by-access-path]].
+    fn format_groups(&self, groups: &[(String, Vec<&crate::domain::NetworkDevice>)],
+        network_data: &NetworkData) -> Vec<String> {
+        let group_count = groups.len();
+        groups.iter().enumerate().flat_map(|(i, (heading, members))| {
+            let is_last_group = i == group_count - 1;
+            self.format_group(heading, members, is_last_group, network_data)
         }).collect()
     }
 
-    /// Inline access-path annotation replacing section placement — e.g.
-    /// `via eno1` when a `DeviceAddress` carries a local `interface_name`,
-    /// `via WireGuard` when only a WireGuard-key-correlated address is
-    /// known. No heuristic guessing beyond what the device's own fields
-    /// state directly, per [[flat-device-list-display]].
+    /// Format one heading line and its nested member device rows.
+    fn format_group(&self, heading: &str, members: &[&crate::domain::NetworkDevice],
+        is_last_group: bool, network_data: &NetworkData) -> Vec<String> {
+        let mut lines = vec![format!("  {}{}", tree_glyph(is_last_group), heading)];
+
+        let indent = format!("  {}", tree_continuation(is_last_group));
+        let member_count = members.len();
+        lines.extend(members.iter().enumerate().flat_map(|(i, device)| {
+            let is_last = i == member_count - 1;
+            self.format_device_entry(device, &indent, is_last, network_data)
+        }));
+
+        lines
+    }
+
+    /// Access path for a device — e.g. `via eno1` when a `DeviceAddress`
+    /// carries a local `interface_name`, `via WireGuard` when only a
+    /// WireGuard-key-correlated address is known. No heuristic guessing
+    /// beyond what the device's own fields state directly, per
+    /// [[flat-device-list-display]]. Since [[nested-tree-by-access-path]],
+    /// this value becomes a group heading rather than inline per-row text.
     fn access_path_annotation(&self, device: &crate::domain::NetworkDevice) -> Option<String> {
         if let Some(name) = device.addresses.iter().find_map(|a| a.interface_name.as_ref()) {
             return Some(format!("via {}", name));
@@ -182,39 +268,36 @@ impl WaybarFormatter {
         None
     }
 
-    /// Format a single device entry with its services and gateway info
-    fn format_device_entry(&self, device: &crate::domain::NetworkDevice, is_last: bool,
+    /// Format a single device entry with its services and gateway info,
+    /// nested under `indent` (the containing group's continuation prefix).
+    fn format_device_entry(&self, device: &crate::domain::NetworkDevice, indent: &str, is_last: bool,
         network_data: &NetworkData) -> Vec<String> {
         let mut lines = Vec::new();
-        let prefix = if is_last { "  └─ " } else { "  ├─ " };
+        let prefix = format!("{}{}", indent, tree_glyph(is_last));
 
         // Main device line
         let display_name = format_identity(&device.identity);
         let colored_name = colorize(device.activity_status(), &display_name);
-        let location = match self.access_path_annotation(device) {
-            Some(annotation) => format!("{}, {}", device.primary_address(), annotation),
-            None => device.primary_address().to_string(),
-        };
-        lines.push(format!("{}{} ({})", prefix, colored_name, location));
+        lines.push(format!("{}{} ({})", prefix, colored_name, device.primary_address()));
 
         // Services
-        if let Some(services_line) = self.format_services(device, is_last) {
+        if let Some(services_line) = self.format_services(device, indent, is_last) {
             lines.push(services_line);
         }
 
         // Gateway/DNS info
-        lines.extend(self.format_gateway_info(device, is_last, network_data));
+        lines.extend(self.format_gateway_info(device, indent, is_last, network_data));
 
         lines
     }
 
     /// Format services list for a device
-    fn format_services(&self, device: &crate::domain::NetworkDevice, is_last: bool) -> Option<String> {
+    fn format_services(&self, device: &crate::domain::NetworkDevice, indent: &str, is_last: bool) -> Option<String> {
         if device.services.is_empty() {
             return None;
         }
 
-        let service_prefix = if is_last { "      " } else { "  │   " };
+        let service_prefix = format!("{}{}", indent, tree_continuation(is_last));
         let mut unique_services: Vec<String> = device.services
             .iter()
             .map(|s| s.friendly_type().to_string())
@@ -230,7 +313,7 @@ impl WaybarFormatter {
     }
 
     /// Format gateway and DNS information for a device
-    fn format_gateway_info(&self, device: &crate::domain::NetworkDevice, is_last: bool,
+    fn format_gateway_info(&self, device: &crate::domain::NetworkDevice, indent: &str, is_last: bool,
         network_data: &NetworkData) -> Vec<String> {
         use std::net::IpAddr;
 
@@ -240,7 +323,7 @@ impl WaybarFormatter {
         }
 
         let mut lines = Vec::new();
-        let info_prefix = if is_last { "      " } else { "  │   " };
+        let info_prefix = format!("{}{}", indent, tree_continuation(is_last));
 
         // Gateway label
         let dns_matches_gateway = network_data.dns_servers.iter().any(|dns| dns == &gateway.0);
@@ -465,11 +548,13 @@ mod tests {
         let data = NetworkData::new(vec![interface], vec![device], None, vec![]);
         let output = formatter.format(&data).unwrap();
 
-        // One device, one row — the badge count and the number of tree
-        // glyphs ("├─"/"└─") in the tooltip must agree.
+        // One device, one device row nested under one group heading — not
+        // two rows for the two addresses. Per [[nested-tree-by-access-path]]
+        // the tooltip is now a two-level tree, so this is one heading glyph
+        // (its single access-path group) plus one device-row glyph.
         assert_eq!(output.text, "🖧 1 device");
         let row_count = output.tooltip.matches("└─").count() + output.tooltip.matches("├─").count();
-        assert_eq!(row_count, 1);
+        assert_eq!(row_count, 2);
     }
 
     #[test]
@@ -556,5 +641,83 @@ mod tests {
         let formatter = WaybarFormatter::new();
         let public: IpAddr = "2001:db8::1".parse().unwrap();
         assert_eq!(formatter.format_dns_entry(&public), "2001:db8::1 (external)");
+    }
+
+    #[test]
+    fn test_format_utc_timestamp_known_epoch() {
+        // 2023-01-13 14:30:00 UTC, per waybar_weather's own equivalent test fixture.
+        let time = UNIX_EPOCH + std::time::Duration::from_secs(1673620200);
+        assert_eq!(format_utc_timestamp(time), "2023-01-13 14:30Z");
+    }
+
+    #[test]
+    fn test_format_utc_timestamp_epoch_zero() {
+        assert_eq!(format_utc_timestamp(UNIX_EPOCH), "1970-01-01 00:00Z");
+    }
+
+    #[test]
+    fn test_tooltip_ends_with_updated_footer() {
+        let formatter = WaybarFormatter::new();
+        let data = NetworkData::new(vec![], vec![], None, vec![]);
+        let output = formatter.format(&data).unwrap();
+
+        assert!(output.tooltip.contains("\n\n🕐 Updated: "));
+        assert!(output.tooltip.ends_with('Z'));
+    }
+
+    #[test]
+    fn test_tooltip_groups_devices_by_access_path_with_other_bucket() {
+        let formatter = WaybarFormatter::new();
+
+        let eno1_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let eno1_mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
+        let eno1_device = local_device(eno1_ip, eno1_mac, "eno1");
+
+        let wg_ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
+        let wg_key = crate::domain::WireGuardPublicKey::new("pubkey123".to_string());
+        let wg_address = crate::domain::DeviceAddress { ip: wg_ip, interface_name: None };
+        let wg_device = NetworkDevice::new(crate::domain::DeviceId::WireGuardKey(wg_key), vec![wg_address], None);
+
+        // No local interface_name and not WireGuard-keyed: falls into "Other".
+        let other_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 200));
+        let other_mac = MacAddress::new("11:22:33:44:55:66".to_string()).unwrap();
+        let other_address = crate::domain::DeviceAddress { ip: other_ip, interface_name: None };
+        let other_device = NetworkDevice::new(crate::domain::DeviceId::Mac(other_mac.clone()), vec![other_address], Some(other_mac));
+
+        let interface = NetworkInterface::new(crate::domain::InterfaceName::new("eno1".to_string()), eno1_ip, None);
+        let data = NetworkData::new(vec![interface], vec![eno1_device, wg_device, other_device], None, vec![]);
+        let output = formatter.format(&data).unwrap();
+
+        assert!(output.tooltip.contains("via eno1"));
+        assert!(output.tooltip.contains("via WireGuard"));
+        assert!(output.tooltip.contains("Other"));
+        // Group order is first-appearance order in the address-sorted device
+        // list: 10.20.30.3 (WireGuard) < 192.168.1.50 (eno1) < 192.168.1.200
+        // (Other) numerically, so that's the expected heading order.
+        let wg_pos = output.tooltip.find("via WireGuard").unwrap();
+        let eno1_pos = output.tooltip.find("via eno1").unwrap();
+        let other_pos = output.tooltip.find("Other").unwrap();
+        assert!(wg_pos < eno1_pos);
+        assert!(eno1_pos < other_pos);
+    }
+
+    #[test]
+    fn test_device_row_nests_under_group_heading() {
+        let formatter = WaybarFormatter::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
+        let interface = NetworkInterface::new(crate::domain::InterfaceName::new("eno1".to_string()), ip, Some(mac.clone()));
+        let device = local_device(ip, mac, "eno1");
+
+        let data = NetworkData::new(vec![interface], vec![device], None, vec![]);
+        let output = formatter.format(&data).unwrap();
+
+        // Heading at the outer level, device row indented one level deeper.
+        assert!(output.tooltip.contains("  └─ via eno1"));
+        assert!(output.tooltip.contains("      └─ "));
+        // The inline "via eno1" annotation is gone from the device row itself
+        // (only the heading states it) — the device row's own parenthesised
+        // location is just the address.
+        assert!(output.tooltip.contains(&format!("({})", ip)));
     }
 }

@@ -11,6 +11,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Parses `neigh` (`ip neigh show`, run on the router) into tiered
 /// observations. Same line shape as `infra::network::proc_parsers`' local
@@ -102,6 +103,9 @@ pub fn parse_clients(output: &str) -> Vec<MacAddress> {
 struct WgDumpPeer {
     public_key: String,
     allowed_ips: Vec<IpAddr>,
+    /// `None` when the raw `latest-handshake` field is `0` — WireGuard's own
+    /// "never handshaked" sentinel — per [[wireguard-handshake-activity]].
+    latest_handshake: Option<SystemTime>,
 }
 
 fn parse_wg_dump_line(line: &str) -> Option<WgDumpPeer> {
@@ -116,10 +120,16 @@ fn parse_wg_dump_line(line: &str) -> Option<WgDumpPeer> {
         .filter_map(|entry| entry.split('/').next())
         .filter_map(|ip| ip.parse().ok())
         .collect();
+    let latest_handshake = parts[5]
+        .parse::<u64>()
+        .ok()
+        .filter(|&epoch_seconds| epoch_seconds != 0)
+        .map(|epoch_seconds| UNIX_EPOCH + Duration::from_secs(epoch_seconds));
 
     Some(WgDumpPeer {
         public_key,
         allowed_ips,
+        latest_handshake,
     })
 }
 
@@ -165,6 +175,7 @@ pub fn parse_wireguard(wg_dump_output: &str, wg_peers_output: &str) -> Result<Ve
         .flat_map(|peer| {
             let friendly_name = peer_names.get(&peer.public_key).cloned();
             let public_key = WireGuardPublicKey::new(peer.public_key.clone());
+            let latest_handshake = peer.latest_handshake;
             peer.allowed_ips
                 .into_iter()
                 .map(move |ip| {
@@ -174,6 +185,9 @@ pub fn parse_wireguard(wg_dump_output: &str, wg_peers_output: &str) -> Result<Ve
                         observation = observation.with_friendly_name(
                             crate::domain::FriendlyName::new(name.clone()),
                         );
+                    }
+                    if let Some(latest_handshake) = latest_handshake {
+                        observation = observation.with_wireguard_latest_handshake(latest_handshake);
                     }
                     TieredObservation {
                         tier: RouterSourceTier::WireGuard,
@@ -350,6 +364,18 @@ BowersNet\t+mP28ziwQ2zZqlBBfYI5xDA3djASAQ66jJqa9osDCxk=\t(none)\t192.168.1.122:5
     }
 
     #[test]
+    fn test_parse_wg_dump_line_zero_handshake_is_none() {
+        let peer = parse_wg_dump_line("BowersNet\tgN4DvXs/DP060P0yLzfTYBMqUAh/qHznuPHw1vOfCUg=\t(none)\t(none)\t10.20.30.3/32\t0\t0\t0\toff").unwrap();
+        assert_eq!(peer.latest_handshake, None);
+    }
+
+    #[test]
+    fn test_parse_wg_dump_line_parses_latest_handshake() {
+        let peer = parse_wg_dump_line("BowersNet\t+mP28ziwQ2zZqlBBfYI5xDA3djASAQ66jJqa9osDCxk=\t(none)\t192.168.1.122:57426\t10.20.30.13/32\t1785651044\t109147828\t282043476\t25").unwrap();
+        assert_eq!(peer.latest_handshake, Some(UNIX_EPOCH + Duration::from_secs(1785651044)));
+    }
+
+    #[test]
     fn test_parse_wg_peers_excludes_router_own_identity() {
         let peer_names = parse_wg_peers(WG_PEERS_OUTPUT).unwrap();
         assert_eq!(peer_names.len(), 2);
@@ -374,6 +400,26 @@ BowersNet\t+mP28ziwQ2zZqlBBfYI5xDA3djASAQ66jJqa9osDCxk=\t(none)\t192.168.1.122:5
         assert_eq!(
             jamie_phone.observation.friendly_name.as_ref().map(|f| f.as_str()),
             Some("Jamie phone")
+        );
+    }
+
+    #[test]
+    fn test_parse_wireguard_carries_latest_handshake() {
+        let observations = parse_wireguard(WG_DUMP_OUTPUT, WG_PEERS_OUTPUT).unwrap();
+
+        let jamie_phone = observations
+            .iter()
+            .find(|o| o.observation.ip == "10.20.30.3".parse::<IpAddr>().unwrap())
+            .unwrap();
+        assert_eq!(jamie_phone.observation.wireguard_latest_handshake, None);
+
+        let andrew_iphone = observations
+            .iter()
+            .find(|o| o.observation.ip == "10.20.30.13".parse::<IpAddr>().unwrap())
+            .unwrap();
+        assert_eq!(
+            andrew_iphone.observation.wireguard_latest_handshake,
+            Some(UNIX_EPOCH + Duration::from_secs(1785651044))
         );
     }
 
