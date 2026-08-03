@@ -1,7 +1,10 @@
 //! Waybar JSON output formatting for network data.
 
 use crate::app::NetworkFormatter;
-use crate::domain::{ActivityStatus, DeviceId, DeviceIdentity, DeviceType, NetworkData};
+use crate::domain::{
+    is_private_address, ActivityStatus, DeviceId, DeviceIdentity, DeviceType, NetworkData,
+    NetworkDevice,
+};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +81,34 @@ impl WaybarFormatter {
     /// Creates a new WaybarFormatter instance
     pub fn new() -> Self {
         Self
+    }
+
+    /// Restricts the device list to private/ULA addresses, per
+    /// [[private-address-only-display]]. Within each device, addresses
+    /// failing `is_private_address` (public IPv4, IPv6 link-local, IPv6
+    /// global unicast) are dropped from `addresses`; a device left with no
+    /// addresses at all — typically the router's WAN-side neighbour,
+    /// surfaced by `neigh` observations that span every router interface —
+    /// is dropped entirely. Applied once, before either the device-count
+    /// text or the tooltip is built, so the two never disagree.
+    fn filter_to_private_devices(&self, devices: &[NetworkDevice]) -> Vec<NetworkDevice> {
+        devices
+            .iter()
+            .filter_map(|device| {
+                let addresses: Vec<_> = device
+                    .addresses
+                    .iter()
+                    .filter(|a| is_private_address(&a.ip))
+                    .cloned()
+                    .collect();
+                if addresses.is_empty() {
+                    return None;
+                }
+                let mut device = device.clone();
+                device.addresses = addresses;
+                Some(device)
+            })
+            .collect()
     }
 
     /// Builds the tooltip: a brief preamble listing this host's own local
@@ -219,6 +250,11 @@ impl WaybarFormatter {
             lines.push(format!("{}  Gateway", info_prefix));
         }
 
+        // WAN address, per [[wan-ip-display]]
+        if let Some(wan_address) = network_data.wan_address {
+            lines.push(format!("{}  WAN: {}", info_prefix, wan_address));
+        }
+
         // Additional DNS servers
         let other_dns: Vec<&IpAddr> = network_data.dns_servers
             .iter()
@@ -236,21 +272,14 @@ impl WaybarFormatter {
         lines
     }
 
-    /// Format a single DNS entry with local/external label
+    /// Format a single DNS entry with local/external label. "Local" means
+    /// private/ULA, via `domain::is_private_address` — the same predicate
+    /// [[private-address-only-display]] uses for device filtering, replacing
+    /// this method's previous IPv4-only octet check (which mislabelled every
+    /// IPv6 DNS server "external" regardless of whether it was actually a
+    /// ULA address).
     fn format_dns_entry(&self, dns: &std::net::IpAddr) -> String {
-        use std::net::IpAddr;
-
-        let is_local = match dns {
-            IpAddr::V4(ipv4) => {
-                let octets = ipv4.octets();
-                octets[0] == 192 && octets[1] == 168
-                    || octets[0] == 10
-                    || (octets[0] == 172 && (16..=31).contains(&octets[1]))
-            }
-            IpAddr::V6(_) => false,
-        };
-
-        if is_local {
+        if is_private_address(dns) {
             format!("{} (local)", dns)
         } else {
             format!("{} (external)", dns)
@@ -274,6 +303,10 @@ impl NetworkFormatter for WaybarFormatter {
 
     /// Formats network data for Waybar display
     fn format(&self, network_data: &NetworkData) -> Result<WaybarOutput> {
+        let mut network_data = network_data.clone();
+        network_data.devices = self.filter_to_private_devices(&network_data.devices);
+        let network_data = &network_data;
+
         let device_count = network_data.devices.len();
 
         // Main text: device count
@@ -437,5 +470,91 @@ mod tests {
         assert_eq!(output.text, "🖧 1 device");
         let row_count = output.tooltip.matches("└─").count() + output.tooltip.matches("├─").count();
         assert_eq!(row_count, 1);
+    }
+
+    #[test]
+    fn test_format_drops_device_with_only_public_address() {
+        // The router's WAN-side neighbour: a real, identified device (has a
+        // MAC) but not a LAN device — per [[private-address-only-display]]
+        // it must not appear at all, not even in the device count.
+        let formatter = WaybarFormatter::new();
+        let public_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
+        let address = crate::domain::DeviceAddress { ip: public_ip, interface_name: None };
+        let device = NetworkDevice::new(crate::domain::DeviceId::Mac(mac.clone()), vec![address], Some(mac));
+
+        let data = NetworkData::new(vec![], vec![device], None, vec![]);
+        let output = formatter.format(&data).unwrap();
+
+        assert_eq!(output.text, "🖧 No devices");
+        assert!(!output.tooltip.contains("203.0.113.7"));
+    }
+
+    #[test]
+    fn test_format_hides_public_address_but_keeps_multi_homed_device() {
+        let formatter = WaybarFormatter::new();
+        let private_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let public_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
+        let addresses = vec![
+            crate::domain::DeviceAddress { ip: private_ip, interface_name: Some(crate::domain::InterfaceName::new("eth0".to_string())) },
+            crate::domain::DeviceAddress { ip: public_ip, interface_name: None },
+        ];
+        let device = NetworkDevice::new(crate::domain::DeviceId::Mac(mac.clone()), addresses, Some(mac));
+
+        let interface = NetworkInterface::new(crate::domain::InterfaceName::new("eth0".to_string()), private_ip, None);
+        let data = NetworkData::new(vec![interface], vec![device], None, vec![]);
+        let output = formatter.format(&data).unwrap();
+
+        assert_eq!(output.text, "🖧 1 device");
+        assert!(output.tooltip.contains("192.168.1.50"));
+        assert!(!output.tooltip.contains("203.0.113.7"));
+    }
+
+    #[test]
+    fn test_format_hides_ipv6_link_local_address() {
+        let formatter = WaybarFormatter::new();
+        let link_local: IpAddr = "fe80::1".parse().unwrap();
+        let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
+        let address = crate::domain::DeviceAddress { ip: link_local, interface_name: None };
+        let device = NetworkDevice::new(crate::domain::DeviceId::Mac(mac.clone()), vec![address], Some(mac));
+
+        let data = NetworkData::new(vec![], vec![device], None, vec![]);
+        let output = formatter.format(&data).unwrap();
+
+        assert_eq!(output.text, "🖧 No devices");
+    }
+
+    #[test]
+    fn test_format_gateway_info_includes_wan_address() {
+        let formatter = WaybarFormatter::new();
+        let gateway_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        let mac = MacAddress::new("00:11:22:33:44:55".to_string()).unwrap();
+        let address = crate::domain::DeviceAddress { ip: gateway_ip, interface_name: Some(crate::domain::InterfaceName::new("eth0".to_string())) };
+        let mut router = NetworkDevice::new(crate::domain::DeviceId::Mac(mac.clone()), vec![address], Some(mac));
+        router.build_identity();
+
+        let wan_address = crate::domain::WanAddress::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)));
+        let interface = NetworkInterface::new(crate::domain::InterfaceName::new("eth0".to_string()), gateway_ip, None);
+        let data = NetworkData::new(vec![interface], vec![router], Some(Gateway::new(gateway_ip)), vec![])
+            .with_wan_address(wan_address);
+        let output = formatter.format(&data).unwrap();
+
+        assert!(output.tooltip.contains("Gateway"));
+        assert!(output.tooltip.contains("WAN: 203.0.113.7"));
+    }
+
+    #[test]
+    fn test_format_dns_entry_labels_ipv6_ula_as_local() {
+        let formatter = WaybarFormatter::new();
+        let ula: IpAddr = "fd25:a234:e8f7::1".parse().unwrap();
+        assert_eq!(formatter.format_dns_entry(&ula), "fd25:a234:e8f7::1 (local)");
+    }
+
+    #[test]
+    fn test_format_dns_entry_labels_public_ipv6_as_external() {
+        let formatter = WaybarFormatter::new();
+        let public: IpAddr = "2001:db8::1".parse().unwrap();
+        assert_eq!(formatter.format_dns_entry(&public), "2001:db8::1 (external)");
     }
 }

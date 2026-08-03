@@ -4,7 +4,7 @@
 //! infrastructure adapters implement. No `use crate::infra::` imports here
 //! outside `#[cfg(test)]`.
 
-use crate::domain::{DeviceAddress, DeviceId, DeviceObservation, Hostname, MacAddress, NetworkDevice, NetworkSnapshot, WireGuardPublicKey};
+use crate::domain::{DeviceAddress, DeviceId, DeviceObservation, Hostname, MacAddress, NetworkDevice, NetworkSnapshot, WanAddress, WireGuardPublicKey};
 use std::collections::HashMap;
 use std::net::IpAddr;
 
@@ -46,6 +46,7 @@ pub struct TieredObservation {
 pub struct RouterSnapshot {
     pub observations: Vec<TieredObservation>,
     pub wifi_clients: Vec<MacAddress>,
+    pub wan_address: Option<WanAddress>,
 }
 
 /// Port trait for collecting router-sourced device observations over SSH.
@@ -186,7 +187,11 @@ pub fn merge_network_and_router(local: NetworkSnapshot, router: RouterSnapshot) 
         .filter_map(|cluster_ips| build_device(cluster_ips, &by_ip, &local_bases))
         .collect();
 
-    NetworkSnapshot::new(local.interfaces, devices, local.gateway, local.dns_servers)
+    let merged = NetworkSnapshot::new(local.interfaces, devices, local.gateway, local.dns_servers);
+    match router.wan_address {
+        Some(wan_address) => merged.with_wan_address(wan_address),
+        None => merged,
+    }
 }
 
 /// Clusters addresses sharing a `mac`/`wireguard_public_key`/`hostname`
@@ -365,6 +370,7 @@ mod tests {
                     .with_hostname("new-name".to_string()),
             }],
             wifi_clients: vec![],
+            wan_address: None,
         };
 
         let merged = merge_network_and_router(local, router);
@@ -397,6 +403,7 @@ mod tests {
                     .with_friendly_name(FriendlyName::new("Jamie phone".to_string())),
             }],
             wifi_clients: vec![],
+            wan_address: None,
         };
 
         let merged = merge_network_and_router(local, router);
@@ -431,6 +438,7 @@ mod tests {
                 },
             ],
             wifi_clients: vec![],
+            wan_address: None,
         };
 
         let merged = merge_network_and_router(local, router);
@@ -461,6 +469,7 @@ mod tests {
                 observation: DeviceObservation::new(link_local_ip).with_mac(mac),
             }],
             wifi_clients: vec![],
+            wan_address: None,
         };
 
         let merged = merge_network_and_router(local, router);
@@ -486,9 +495,32 @@ mod tests {
                 observation: DeviceObservation::new(ip).with_neighbor_state(NeighborState::Failed),
             }],
             wifi_clients: vec![],
+            wan_address: None,
         };
 
         let merged = merge_network_and_router(local, router);
         assert_eq!(merged.devices.len(), 0);
+    }
+
+    #[test]
+    fn test_merge_carries_router_wan_address_onto_snapshot() {
+        let local = NetworkSnapshot::new(vec![], vec![], None, vec![]);
+        let wan_address = WanAddress::new("203.0.113.7".parse().unwrap());
+
+        let router = RouterSnapshot {
+            observations: vec![],
+            wifi_clients: vec![],
+            wan_address: Some(wan_address),
+        };
+
+        let merged = merge_network_and_router(local, router);
+        assert_eq!(merged.wan_address, Some(wan_address));
+    }
+
+    #[test]
+    fn test_merge_wan_address_absent_when_router_silent() {
+        let local = NetworkSnapshot::new(vec![], vec![], None, vec![]);
+        let merged = merge_network_and_router(local, RouterSnapshot::default());
+        assert_eq!(merged.wan_address, None);
     }
 }

@@ -26,6 +26,7 @@ impl RouterFetcher for SshRouterFetcher {
         let wg_dump_output = ssh::run_dispatch_command(&self.host, "wg-dump")?;
         let wg_peers_output = ssh::run_dispatch_command(&self.host, "wg-peers")?;
         let clients_output = ssh::run_dispatch_command(&self.host, "clients")?;
+        let wan_ip_output = ssh::run_dispatch_command(&self.host, "wan-ip")?;
 
         let mut observations = models::parse_leases(&leases_output);
         observations.extend(models::parse_neigh(&neigh_output));
@@ -34,6 +35,7 @@ impl RouterFetcher for SshRouterFetcher {
         Ok(RouterSnapshot {
             observations,
             wifi_clients: models::parse_clients(&clients_output),
+            wan_address: models::parse_wan_ip(&wan_ip_output)?,
         })
     }
 }

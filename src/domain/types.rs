@@ -709,6 +709,39 @@ impl fmt::Display for Gateway {
     }
 }
 
+/// The router's external (WAN-side) address, as reported by the router
+/// itself over SSH — see [[wan-ip-display]]. Mirrors `Gateway`'s shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WanAddress(pub IpAddr);
+
+impl WanAddress {
+    pub fn new(ip: IpAddr) -> Self {
+        Self(ip)
+    }
+}
+
+impl fmt::Display for WanAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Whether an address is a private (RFC1918 IPv4) or IPv6 Unique Local
+/// Address (`fc00::/7`). IPv6 link-local (`fe80::/10`) deliberately returns
+/// `false` here — per [[private-address-only-display]], it isn't treated as
+/// private for this widget's purposes. A pure classification fact, not a
+/// filtering policy — see that decision for where the policy of what to do
+/// with a non-private address lives.
+pub fn is_private_address(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_private(),
+        IpAddr::V6(v6) => {
+            let octets = v6.octets();
+            (octets[0] & 0xfe) == 0xfc
+        }
+    }
+}
+
 /// Complete network snapshot at a point in time
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkSnapshot {
@@ -716,6 +749,7 @@ pub struct NetworkSnapshot {
     pub devices: Vec<NetworkDevice>,
     pub gateway: Option<Gateway>,
     pub dns_servers: Vec<IpAddr>,
+    pub wan_address: Option<WanAddress>,
 }
 
 impl NetworkSnapshot {
@@ -730,9 +764,19 @@ impl NetworkSnapshot {
             devices,
             gateway,
             dns_servers,
+            wan_address: None,
         }
     }
 
+    /// Attaches the router's WAN address, per [[wan-ip-display]]. Builder
+    /// style, matching `DeviceObservation`'s existing `with_*` methods —
+    /// avoids a fifth positional `NetworkSnapshot::new` argument that every
+    /// existing call site (most of which never know a WAN address) would
+    /// otherwise have to thread through.
+    pub fn with_wan_address(mut self, wan_address: WanAddress) -> Self {
+        self.wan_address = Some(wan_address);
+        self
+    }
 }
 
 // For backward compatibility with existing code
@@ -874,5 +918,53 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
         let gateway = Gateway::new(ip);
         assert_eq!(format!("{}", gateway), "192.168.1.1");
+    }
+
+    #[test]
+    fn test_wan_address_creation() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let wan = WanAddress::new(ip);
+        assert_eq!(format!("{}", wan), "203.0.113.7");
+    }
+
+    #[test]
+    fn test_network_snapshot_with_wan_address() {
+        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let snapshot = NetworkSnapshot::new(vec![], vec![], None, vec![])
+            .with_wan_address(WanAddress::new(ip));
+        assert_eq!(snapshot.wan_address, Some(WanAddress::new(ip)));
+    }
+
+    #[test]
+    fn test_is_private_address_rfc1918_ipv4() {
+        assert!(is_private_address(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+        assert!(is_private_address(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(is_private_address(&IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+    }
+
+    #[test]
+    fn test_is_private_address_public_ipv4_is_not_private() {
+        assert!(!is_private_address(&IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))));
+        assert!(!is_private_address(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+    }
+
+    #[test]
+    fn test_is_private_address_ula_ipv6() {
+        let ula: IpAddr = "fd12:3456:789a::1".parse().unwrap();
+        assert!(is_private_address(&ula));
+        let ula_fc: IpAddr = "fc00::1".parse().unwrap();
+        assert!(is_private_address(&ula_fc));
+    }
+
+    #[test]
+    fn test_is_private_address_link_local_ipv6_is_not_private() {
+        let link_local: IpAddr = "fe80::1".parse().unwrap();
+        assert!(!is_private_address(&link_local));
+    }
+
+    #[test]
+    fn test_is_private_address_public_ipv6_is_not_private() {
+        let public: IpAddr = "2001:db8::1".parse().unwrap();
+        assert!(!is_private_address(&public));
     }
 }

@@ -6,11 +6,11 @@
 //! wiki).
 
 use crate::app::{RouterSourceTier, TieredObservation};
-use crate::domain::{DeviceObservation, MacAddress, NeighborState, WireGuardPublicKey};
+use crate::domain::{DeviceObservation, MacAddress, NeighborState, WanAddress, WireGuardPublicKey};
 use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 /// Parses `neigh` (`ip neigh show`, run on the router) into tiered
 /// observations. Same line shape as `infra::network::proc_parsers`' local
@@ -183,6 +183,32 @@ pub fn parse_wireguard(wg_dump_output: &str, wg_peers_output: &str) -> Result<Ve
                 .collect::<Vec<_>>()
         })
         .collect())
+}
+
+/// One `ipv4-address` entry from `ubus call network.interface.wan status`.
+#[derive(Debug, Deserialize)]
+struct UbusIpv4Address {
+    address: Ipv4Addr,
+}
+
+/// Shape of `ubus call network.interface.wan status`'s JSON output, reduced
+/// to the one field this parser reads.
+#[derive(Debug, Deserialize)]
+struct UbusWanStatus {
+    #[serde(rename = "ipv4-address", default)]
+    ipv4_address: Vec<UbusIpv4Address>,
+}
+
+/// Parses `wan-ip` (`ubus call network.interface.wan status`) into the
+/// router's external address, per [[wan-ip-display]]. `None` if the WAN
+/// interface is up but reports no IPv4 address (e.g. IPv6-only) — this is
+/// not itself an error. IPv6 WAN addresses are out of scope for this pass.
+pub fn parse_wan_ip(output: &str) -> Result<Option<WanAddress>> {
+    let status: UbusWanStatus = serde_json::from_str(output)?;
+    Ok(status
+        .ipv4_address
+        .first()
+        .map(|entry| WanAddress::new(IpAddr::V4(entry.address))))
 }
 
 #[cfg(test)]
@@ -361,5 +387,31 @@ BowersNet\t+mP28ziwQ2zZqlBBfYI5xDA3djASAQ66jJqa9osDCxk=\t(none)\t192.168.1.122:5
             o.observation.ip == "10.20.30.99".parse::<IpAddr>().unwrap()
         }));
         assert_eq!(observations.len(), 2);
+    }
+
+    const WAN_STATUS_OUTPUT: &str = r#"{
+    "up": true,
+    "pending": false,
+    "available": true,
+    "device": "pppoe-wan",
+    "ipv4-address": [
+        {
+            "address": "203.0.113.7",
+            "mask": 32
+        }
+    ]
+}"#;
+
+    #[test]
+    fn test_parse_wan_ip_extracts_ipv4_address() {
+        let wan_address = parse_wan_ip(WAN_STATUS_OUTPUT).unwrap();
+        assert_eq!(wan_address, Some(WanAddress::new("203.0.113.7".parse().unwrap())));
+    }
+
+    #[test]
+    fn test_parse_wan_ip_none_when_no_ipv4_address() {
+        let output = r#"{"up": true, "ipv4-address": []}"#;
+        let wan_address = parse_wan_ip(output).unwrap();
+        assert_eq!(wan_address, None);
     }
 }
