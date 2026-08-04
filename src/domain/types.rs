@@ -230,7 +230,11 @@ pub enum ActivityStatus {
     Active,      // < 30 seconds
     Recent,      // < 5 minutes
     Idle,        // < 30 minutes
-    Stale,       // > 30 minutes
+    Stale,       // < 24 hours
+    /// Not seen for 24 hours or more — see [[device-recency-and-removal]].
+    /// [[infra-display-module-rules]] filters devices in this state out of
+    /// the tooltip entirely rather than colouring them.
+    Removed,
 }
 
 impl ActivityStatus {
@@ -246,17 +250,20 @@ impl ActivityStatus {
             Self::Recent
         } else if elapsed < Duration::from_secs(1800) {
             Self::Idle
-        } else {
+        } else if elapsed < Duration::from_secs(86400) {
             Self::Stale
+        } else {
+            Self::Removed
         }
     }
 
     /// Activity status for a WireGuard peer, from its tunnel's latest
-    /// handshake time — a plain two-way split, `Active` within the last
-    /// hour else `Stale`, deliberately not the four-tier `from_last_seen`
-    /// scheme: "minutes since last poll noticed you" isn't meaningful for
-    /// a tunnel peer the way it is for a freshly-discovered LAN device. See
-    /// [[wireguard-handshake-activity]].
+    /// handshake time — a plain two-way split below the `Removed` ceiling
+    /// (`Active` within the last hour, else `Stale`), deliberately not the
+    /// four-tier `from_last_seen` scheme: "minutes since last poll noticed
+    /// you" isn't meaningful for a tunnel peer the way it is for a
+    /// freshly-discovered LAN device. See [[wireguard-handshake-activity]]
+    /// and [[device-recency-and-removal]].
     pub fn from_wireguard_handshake(latest_handshake: SystemTime) -> Self {
         let elapsed = SystemTime::now()
             .duration_since(latest_handshake)
@@ -264,8 +271,10 @@ impl ActivityStatus {
 
         if elapsed < Duration::from_secs(3600) {
             Self::Active
-        } else {
+        } else if elapsed < Duration::from_secs(86400) {
             Self::Stale
+        } else {
+            Self::Removed
         }
     }
 }
@@ -397,6 +406,38 @@ pub enum DeviceId {
     Ip(IpAddr),
 }
 
+/// A device's relationship to WireGuard, replacing what used to be two
+/// independent `Option`s (`wireguard_public_key`, `wireguard_latest_handshake`)
+/// per [[device-recency-and-removal]]. Those two `Option`s let "not a
+/// WireGuard device" and "a WireGuard device that's never handshaked" both
+/// read as the same `None`, which is exactly why `NetworkDevice::activity_status`
+/// couldn't tell them apart and every never-handshaked peer read as `Active`
+/// — see that decision. `Never` is the bottom of a preorder: every real
+/// handshake timestamp is "more recent" than it, and it maps unconditionally
+/// to `ActivityStatus::Removed` rather than falling through to any
+/// time-based calculation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WireGuardActivity {
+    /// Not a WireGuard peer at all.
+    NotApplicable,
+    /// A configured WireGuard peer whose tunnel has never handshaked.
+    Never(WireGuardPublicKey),
+    /// A configured WireGuard peer with a real handshake timestamp.
+    LastHandshake(WireGuardPublicKey, SystemTime),
+}
+
+impl WireGuardActivity {
+    /// The public key, if this is a WireGuard peer at all — the
+    /// correlation signal `app`'s merge fold clusters WireGuard addresses
+    /// by, since WireGuard peers have no MAC.
+    pub fn public_key(&self) -> Option<&WireGuardPublicKey> {
+        match self {
+            Self::NotApplicable => None,
+            Self::Never(key) | Self::LastHandshake(key, _) => Some(key),
+        }
+    }
+}
+
 /// One address a device is reachable at, plus which of *this host's own*
 /// interfaces it was seen on locally (`None` for a router-only address —
 /// there is no local NIC to attribute it to).
@@ -411,8 +452,8 @@ pub struct DeviceAddress {
 /// but `ip` is optional — a source reports what it happens to know.
 /// Grouped first by exact `ip` (the same address genuinely is the same
 /// address), then correlated across different addresses of the same
-/// physical device via `mac`/`wireguard_public_key`/`hostname` — see
-/// [[device-catalogue-identity]].
+/// physical device via `mac`/the `wireguard_activity` public key/`hostname`
+/// — see [[device-catalogue-identity]].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceObservation {
     pub ip: IpAddr,
@@ -421,11 +462,7 @@ pub struct DeviceObservation {
     pub friendly_name: Option<FriendlyName>,
     pub interface_name: Option<InterfaceName>,
     pub neighbor_state: Option<NeighborState>,
-    pub wireguard_public_key: Option<WireGuardPublicKey>,
-    /// A WireGuard peer's last handshake time, per [[wireguard-handshake-activity]]
-    /// — `None` means no handshake has ever been reported (including
-    /// `wg-dump`'s "never handshaked" `0` sentinel), not "unknown".
-    pub wireguard_latest_handshake: Option<SystemTime>,
+    pub wireguard_activity: WireGuardActivity,
 }
 
 impl DeviceObservation {
@@ -439,8 +476,7 @@ impl DeviceObservation {
             friendly_name: None,
             interface_name: None,
             neighbor_state: None,
-            wireguard_public_key: None,
-            wireguard_latest_handshake: None,
+            wireguard_activity: WireGuardActivity::NotApplicable,
         }
     }
 
@@ -464,13 +500,15 @@ impl DeviceObservation {
         self
     }
 
-    pub fn with_wireguard_public_key(mut self, key: WireGuardPublicKey) -> Self {
-        self.wireguard_public_key = Some(key);
-        self
-    }
-
-    pub fn with_wireguard_latest_handshake(mut self, latest_handshake: SystemTime) -> Self {
-        self.wireguard_latest_handshake = Some(latest_handshake);
+    /// Sets this observation's WireGuard relationship. `latest_handshake:
+    /// None` (the `wg-dump` "never handshaked" `0` sentinel) becomes
+    /// `WireGuardActivity::Never`, not a state this method leaves
+    /// unrepresented — see [[device-recency-and-removal]].
+    pub fn with_wireguard_activity(mut self, key: WireGuardPublicKey, latest_handshake: Option<SystemTime>) -> Self {
+        self.wireguard_activity = match latest_handshake {
+            Some(t) => WireGuardActivity::LastHandshake(key, t),
+            None => WireGuardActivity::Never(key),
+        };
         self
     }
 }
@@ -489,9 +527,14 @@ pub struct NetworkDevice {
     pub last_seen: SystemTime,
     pub neighbor_state: NeighborState,
     pub identity: DeviceIdentity,
-    /// See [[wireguard-handshake-activity]] — `Some` overrides `activity_status()`'s
-    /// usual `neighbor_state`/`last_seen`-based calculation.
-    pub wireguard_latest_handshake: Option<SystemTime>,
+    /// See [[wireguard-handshake-activity]] and [[device-recency-and-removal]]
+    /// — anything but `NotApplicable` overrides `activity_status()`'s usual
+    /// `neighbor_state`/`last_seen`-based calculation.
+    pub wireguard_activity: WireGuardActivity,
+    /// Set by [[app-module-rules]]'s merge fold from a `clients` (Wi-Fi
+    /// assoclist) MAC match — see [[device-recency-and-removal]]. Feeds
+    /// [[infra-display-module-rules]]'s `via Wi-Fi` access-path grouping.
+    pub on_wifi: bool,
 }
 
 impl NetworkDevice {
@@ -505,7 +548,8 @@ impl NetworkDevice {
             last_seen: SystemTime::now(),
             neighbor_state: NeighborState::Unknown,
             identity: DeviceIdentity::new(),
-            wireguard_latest_handshake: None,
+            wireguard_activity: WireGuardActivity::NotApplicable,
+            on_wifi: false,
         }
     }
 
@@ -524,16 +568,22 @@ impl NetworkDevice {
             .expect("NetworkDevice always has at least one address")
     }
 
-    /// Get activity status. A WireGuard peer's `wireguard_latest_handshake`,
-    /// when present, takes priority over `neighbor_state`/`last_seen` — see
-    /// [[wireguard-handshake-activity]]: WireGuard peers never appear in the
-    /// kernel neighbor table (`neighbor_state` is always `Unknown` for them),
-    /// and `last_seen` is reset to "now" on every poll's device rebuild, so
-    /// falling through to the time-based calculation always read `Active`
-    /// regardless of real tunnel activity.
+    /// Get activity status. A WireGuard peer's `wireguard_activity`, when
+    /// not `NotApplicable`, takes priority over `neighbor_state`/`last_seen`
+    /// — see [[wireguard-handshake-activity]] and [[device-recency-and-removal]]:
+    /// WireGuard peers never appear in the kernel neighbor table
+    /// (`neighbor_state` is always `Unknown` for them), so before the
+    /// original fix, every WireGuard peer read as `Active` regardless of
+    /// real tunnel activity. `Never` (configured, no handshake ever) maps
+    /// unconditionally to `Removed` rather than falling through to that
+    /// same broken path — the bug the `Never` case originally hit.
     pub fn activity_status(&self) -> ActivityStatus {
-        if let Some(latest_handshake) = self.wireguard_latest_handshake {
-            return ActivityStatus::from_wireguard_handshake(latest_handshake);
+        match &self.wireguard_activity {
+            WireGuardActivity::NotApplicable => {}
+            WireGuardActivity::Never(_) => return ActivityStatus::Removed,
+            WireGuardActivity::LastHandshake(_, latest_handshake) => {
+                return ActivityStatus::from_wireguard_handshake(*latest_handshake);
+            }
         }
 
         match self.neighbor_state {
@@ -920,27 +970,39 @@ mod tests {
         assert_eq!(observation.hostname, Some("phone.lan".to_string()));
         assert_eq!(observation.friendly_name, None);
         assert_eq!(observation.neighbor_state, None);
-        assert_eq!(observation.wireguard_public_key, None);
+        assert_eq!(observation.wireguard_activity, WireGuardActivity::NotApplicable);
     }
 
     #[test]
-    fn test_device_observation_with_wireguard_public_key() {
+    fn test_device_observation_with_wireguard_activity_never_handshaked() {
         let ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
         let key = WireGuardPublicKey::new("gN4DvXs=".to_string());
 
-        let observation = DeviceObservation::new(ip).with_wireguard_public_key(key.clone());
+        let observation = DeviceObservation::new(ip).with_wireguard_activity(key.clone(), None);
 
-        assert_eq!(observation.wireguard_public_key, Some(key));
+        assert_eq!(observation.wireguard_activity, WireGuardActivity::Never(key));
     }
 
     #[test]
-    fn test_device_observation_with_wireguard_latest_handshake() {
+    fn test_device_observation_with_wireguard_activity_last_handshake() {
         let ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
+        let key = WireGuardPublicKey::new("gN4DvXs=".to_string());
         let handshake = SystemTime::now() - Duration::from_secs(120);
 
-        let observation = DeviceObservation::new(ip).with_wireguard_latest_handshake(handshake);
+        let observation = DeviceObservation::new(ip).with_wireguard_activity(key.clone(), Some(handshake));
 
-        assert_eq!(observation.wireguard_latest_handshake, Some(handshake));
+        assert_eq!(observation.wireguard_activity, WireGuardActivity::LastHandshake(key, handshake));
+    }
+
+    #[test]
+    fn test_wireguard_activity_public_key() {
+        let key = WireGuardPublicKey::new("gN4DvXs=".to_string());
+        assert_eq!(WireGuardActivity::NotApplicable.public_key(), None);
+        assert_eq!(WireGuardActivity::Never(key.clone()).public_key(), Some(&key));
+        assert_eq!(
+            WireGuardActivity::LastHandshake(key.clone(), SystemTime::now()).public_key(),
+            Some(&key)
+        );
     }
 
     #[test]
@@ -956,6 +1018,24 @@ mod tests {
     }
 
     #[test]
+    fn test_activity_status_from_wireguard_handshake_over_a_day_is_removed() {
+        let handshake = SystemTime::now() - Duration::from_secs(86401);
+        assert_eq!(ActivityStatus::from_wireguard_handshake(handshake), ActivityStatus::Removed);
+    }
+
+    #[test]
+    fn test_activity_status_from_last_seen_over_a_day_is_removed() {
+        let last_seen = SystemTime::now() - Duration::from_secs(86401);
+        assert_eq!(ActivityStatus::from_last_seen(last_seen), ActivityStatus::Removed);
+    }
+
+    #[test]
+    fn test_activity_status_from_last_seen_just_under_a_day_is_stale_not_removed() {
+        let last_seen = SystemTime::now() - Duration::from_secs(86399);
+        assert_eq!(ActivityStatus::from_last_seen(last_seen), ActivityStatus::Stale);
+    }
+
+    #[test]
     fn test_network_device_activity_status_prefers_wireguard_handshake_over_stale_last_seen() {
         // Regression test for the bug motivating [[wireguard-handshake-activity]]:
         // a WireGuard peer's neighbor_state is always Unknown, and last_seen is
@@ -964,7 +1044,9 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
         let address = DeviceAddress { ip, interface_name: None };
         let mut device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
-        device.wireguard_latest_handshake = Some(SystemTime::now() - Duration::from_secs(7200));
+        let key = WireGuardPublicKey::new("gN4DvXs=".to_string());
+        device.wireguard_activity =
+            WireGuardActivity::LastHandshake(key, SystemTime::now() - Duration::from_secs(7200));
 
         assert_eq!(device.activity_status(), ActivityStatus::Stale);
     }
@@ -974,9 +1056,27 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
         let address = DeviceAddress { ip, interface_name: None };
         let mut device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
-        device.wireguard_latest_handshake = Some(SystemTime::now() - Duration::from_secs(30));
+        let key = WireGuardPublicKey::new("gN4DvXs=".to_string());
+        device.wireguard_activity =
+            WireGuardActivity::LastHandshake(key, SystemTime::now() - Duration::from_secs(30));
 
         assert_eq!(device.activity_status(), ActivityStatus::Active);
+    }
+
+    #[test]
+    fn test_network_device_activity_status_never_handshaked_is_removed() {
+        // Regression test for the bug motivating [[device-recency-and-removal]]:
+        // a never-handshaked WireGuard peer used to fall through to the
+        // generic neighbor_state/last_seen path (always Unknown/"now" for a
+        // WireGuard peer) and read as Active. It must now read Removed
+        // unconditionally, without consulting neighbor_state or last_seen.
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
+        let address = DeviceAddress { ip, interface_name: None };
+        let mut device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
+        let key = WireGuardPublicKey::new("gN4DvXs=".to_string());
+        device.wireguard_activity = WireGuardActivity::Never(key);
+
+        assert_eq!(device.activity_status(), ActivityStatus::Removed);
     }
 
     #[test]

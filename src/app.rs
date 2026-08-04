@@ -4,9 +4,10 @@
 //! infrastructure adapters implement. No `use crate::infra::` imports here
 //! outside `#[cfg(test)]`.
 
-use crate::domain::{DeviceAddress, DeviceId, DeviceObservation, Hostname, MacAddress, NetworkDevice, NetworkSnapshot, WanAddress, WireGuardPublicKey};
+use crate::domain::{DeviceAddress, DeviceId, DeviceObservation, Hostname, MacAddress, NetworkDevice, NetworkSnapshot, WanAddress, WireGuardActivity, WireGuardPublicKey};
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::time::SystemTime;
 
 /// Port trait for collecting a network snapshot.
 ///
@@ -79,23 +80,6 @@ pub fn fetch_and_format<F: NetworkFetcher, Fmt: NetworkFormatter>(
     formatter.format(&data)
 }
 
-/// Collect a network snapshot, collect router observations, merge them, and
-/// format the result.
-///
-/// Router presence is binary (see [[router-integration]]): if
-/// `router_fetcher.collect()` fails, that `Err` propagates as a full
-/// collection failure — there is no fallback to local-only data.
-pub fn fetch_merge_and_format<F: NetworkFetcher, R: RouterFetcher, Fmt: NetworkFormatter>(
-    fetcher: &F,
-    router_fetcher: &R,
-    formatter: &Fmt,
-) -> Result<Fmt::Output, anyhow::Error> {
-    let local = fetcher.collect()?;
-    let router = router_fetcher.collect()?;
-    let merged = merge_network_and_router(local, router);
-    formatter.format(&merged)
-}
-
 /// Where a `TieredObservation`'s tier ranks against local data. Lower rank
 /// wins the fold. Router sources always outrank local, per
 /// [[router-integration]]'s fixed priority order (DHCP lease > neighbour
@@ -145,14 +129,25 @@ impl UnionFind {
 ///    from [[router-integration]] — the same address genuinely is the same
 ///    address).
 /// 2. The resulting per-address groups are then clustered by shared
-///    `mac`/`wireguard_public_key`/`hostname` (union-find, transitive), so a
+///    `mac`/WireGuard public key/`hostname` (union-find, transitive), so a
 ///    device with more than one address — dual-homed via two local
 ///    interfaces, or with multiple IPv6 addresses alongside an IPv4 one —
 ///    becomes one `NetworkDevice`, not several.
 ///
-/// `clients` (`router.wifi_clients`) does not participate in either pass —
-/// see `RouterSnapshot`'s doc comment.
-pub fn merge_network_and_router(local: NetworkSnapshot, router: RouterSnapshot) -> NetworkSnapshot {
+/// Always runs, even with an empty/default `RouterSnapshot` (no router
+/// configured) — per [[device-recency-and-removal]], this is what makes the
+/// persisted-history/`Removed` treatment apply uniformly regardless of
+/// source, not just to router users. `router.wifi_clients` does not
+/// participate in either pass (see `RouterSnapshot`'s doc comment); it's
+/// consulted per-device inside `build_device`, alongside `history`, to
+/// populate `on_wifi` and to decide whether this poll counts as a fresh
+/// observation. Returns the updated history alongside the snapshot — the
+/// caller (`main`) is responsible for persisting it.
+pub fn merge_network_and_router(
+    local: NetworkSnapshot,
+    router: RouterSnapshot,
+    history: &HashMap<DeviceId, SystemTime>,
+) -> (NetworkSnapshot, HashMap<DeviceId, SystemTime>) {
     let mut by_ip: HashMap<IpAddr, Vec<(u8, DeviceObservation)>> = HashMap::new();
     let mut local_bases: HashMap<IpAddr, NetworkDevice> = HashMap::new();
 
@@ -177,21 +172,38 @@ pub fn merge_network_and_router(local: NetworkSnapshot, router: RouterSnapshot) 
         }
     }
 
+    let wifi_clients = router.wifi_clients;
+
     for tiered in router.observations {
         let ip = tiered.observation.ip;
         by_ip.entry(ip).or_default().push((tier_rank(tiered.tier), tiered.observation));
     }
 
-    let devices = cluster_by_identity_signal(&by_ip)
+    let ctx = BuildContext {
+        by_ip: &by_ip,
+        local_bases: &local_bases,
+        wifi_clients: &wifi_clients,
+        history,
+        now: SystemTime::now(),
+    };
+    let mut new_history = history.clone();
+    let devices: Vec<NetworkDevice> = cluster_by_identity_signal(&by_ip)
         .into_iter()
-        .filter_map(|cluster_ips| build_device(cluster_ips, &by_ip, &local_bases))
+        .filter_map(|cluster_ips| build_device(cluster_ips, &ctx))
+        .map(|(device, history_update)| {
+            if let Some((id, seen_at)) = history_update {
+                new_history.insert(id, seen_at);
+            }
+            device
+        })
         .collect();
 
     let merged = NetworkSnapshot::new(local.interfaces, devices, local.gateway, local.dns_servers);
-    match router.wan_address {
+    let merged = match router.wan_address {
         Some(wan_address) => merged.with_wan_address(wan_address),
         None => merged,
-    }
+    };
+    (merged, new_history)
 }
 
 /// Clusters addresses sharing a `mac`/`wireguard_public_key`/`hostname`
@@ -213,7 +225,7 @@ fn cluster_by_identity_signal(by_ip: &HashMap<IpAddr, Vec<(u8, DeviceObservation
                     None => { mac_index.insert(mac.clone(), i); }
                 }
             }
-            if let Some(key) = &obs.wireguard_public_key {
+            if let Some(key) = obs.wireguard_activity.public_key() {
                 match wg_index.get(key) {
                     Some(&j) => uf.union(i, j),
                     None => { wg_index.insert(key.clone(), i); }
@@ -241,22 +253,45 @@ fn primary_ip(ips: &[IpAddr]) -> IpAddr {
     ips.iter().find(|ip| ip.is_ipv4()).copied().unwrap_or(ips[0])
 }
 
+/// Everything `build_device` needs beyond the cluster's own addresses,
+/// bundled per house style's four-parameter limit.
+struct BuildContext<'a> {
+    by_ip: &'a HashMap<IpAddr, Vec<(u8, DeviceObservation)>>,
+    local_bases: &'a HashMap<IpAddr, NetworkDevice>,
+    /// `router.wifi_clients` — MAC-keyed side lookup, not a fold
+    /// participant (see `RouterSnapshot`'s doc comment).
+    wifi_clients: &'a [MacAddress],
+    /// Persisted per-device last-observed timestamps from the previous
+    /// poll, per [[device-recency-and-removal]]. Never consulted for
+    /// WireGuard-identified devices — their clock is `wireguard_activity`.
+    history: &'a HashMap<DeviceId, SystemTime>,
+    /// Captured once per merge, not re-read per device, so every device
+    /// built from the same poll shares an identical "now".
+    now: SystemTime,
+}
+
 /// Builds one `NetworkDevice` from a cluster of correlated addresses, or
 /// `None` if the cluster carries no identity signal at all (`mac`,
-/// `wireguard_public_key`, and `hostname` all absent on every observation —
+/// WireGuard public key, and `hostname` all absent on every observation —
 /// in practice, `neigh` lines with no `lladdr`: the kernel's own
 /// incomplete/failed ARP entries, not real devices).
-fn build_device(
-    cluster_ips: Vec<IpAddr>,
-    by_ip: &HashMap<IpAddr, Vec<(u8, DeviceObservation)>>,
-    local_bases: &HashMap<IpAddr, NetworkDevice>,
-) -> Option<NetworkDevice> {
+///
+/// Alongside the device, returns the persisted-history update this device
+/// should cause (`Some((id, now))` if this poll counted as a fresh
+/// observation of a non-WireGuard device, `None` otherwise) — the caller
+/// folds these into the returned history map. See
+/// [[device-recency-and-removal]].
+fn build_device(cluster_ips: Vec<IpAddr>, ctx: &BuildContext) -> Option<(NetworkDevice, Option<(DeviceId, SystemTime)>)> {
     let mut flattened: Vec<&(u8, DeviceObservation)> =
-        cluster_ips.iter().flat_map(|ip| by_ip[ip].iter()).collect();
+        cluster_ips.iter().flat_map(|ip| ctx.by_ip[ip].iter()).collect();
     flattened.sort_by_key(|(rank, _)| *rank);
 
     let mac = flattened.iter().find_map(|(_, o)| o.mac.clone());
-    let wireguard_public_key = flattened.iter().find_map(|(_, o)| o.wireguard_public_key.clone());
+    let wireguard_activity = flattened.iter().find_map(|(_, o)| match &o.wireguard_activity {
+        WireGuardActivity::NotApplicable => None,
+        activity => Some(activity.clone()),
+    });
+    let wireguard_public_key = wireguard_activity.as_ref().and_then(|a| a.public_key().cloned());
     let hostname = flattened.iter().find_map(|(_, o)| o.hostname.clone());
 
     if mac.is_none() && wireguard_public_key.is_none() && hostname.is_none() {
@@ -265,7 +300,6 @@ fn build_device(
 
     let friendly_name = flattened.iter().find_map(|(_, o)| o.friendly_name.clone());
     let neighbor_state = flattened.iter().find_map(|(_, o)| o.neighbor_state);
-    let wireguard_latest_handshake = flattened.iter().find_map(|(_, o)| o.wireguard_latest_handshake);
 
     let id = match (&mac, &wireguard_public_key, &hostname) {
         (Some(mac), _, _) => DeviceId::Mac(mac.clone()),
@@ -277,32 +311,64 @@ fn build_device(
     let mut addresses: Vec<DeviceAddress> = cluster_ips
         .iter()
         .map(|ip| {
-            let interface_name = by_ip[ip].iter().find_map(|(_, o)| o.interface_name.clone());
+            let interface_name = ctx.by_ip[ip].iter().find_map(|(_, o)| o.interface_name.clone());
             DeviceAddress { ip: *ip, interface_name }
         })
         .collect();
     addresses.sort_by_key(|a| a.ip);
 
-    let base = cluster_ips.iter().find_map(|ip| local_bases.get(ip).cloned());
+    // A "neigh vote" — this poll positively placed the device via a live
+    // kernel-neighbour-table read, whether this host's own (`LOCAL_RANK`)
+    // or the router's (`RouterSourceTier::NeighborTable`). Both are
+    // equally valid "seen right now" evidence; `leases`/`wg-peers` never
+    // vote (durable bindings, not activity) — see [[device-recency-and-removal]].
+    let neigh_vote = flattened
+        .iter()
+        .any(|(rank, _)| *rank == LOCAL_RANK || *rank == tier_rank(RouterSourceTier::NeighborTable));
+
+    let base = cluster_ips.iter().find_map(|ip| ctx.local_bases.get(ip).cloned());
     let mut device = base.unwrap_or_else(|| NetworkDevice::new(id.clone(), addresses.clone(), mac.clone()));
 
     device.id = id;
     device.addresses = addresses;
-    device.mac = mac;
+    device.mac = mac.clone();
     if let Some(hostname) = hostname {
         device.hostname = Hostname::resolved(hostname);
     }
     if let Some(state) = neighbor_state {
         device.neighbor_state = state;
     }
-    device.wireguard_latest_handshake = wireguard_latest_handshake;
+    device.wireguard_activity = wireguard_activity.unwrap_or(WireGuardActivity::NotApplicable);
+    device.on_wifi = mac.is_some_and(|m| ctx.wifi_clients.contains(&m));
 
     device.build_identity();
     if let Some(friendly_name) = friendly_name {
         device.identity.friendly_name = Some(friendly_name);
     }
 
-    Some(device)
+    // last_seen/history only applies to non-WireGuard devices — WireGuard's
+    // own clock (wireguard_activity) is authoritative and never touches the
+    // persisted history file. A device counts as freshly observed this poll
+    // on a neigh_vote (mDNS can only ever enrich a device already found via
+    // neigh, so it carries no separate vote) or a `clients` (Wi-Fi) match.
+    // Not observed this poll falls back to the persisted value, or the
+    // epoch if there's no persisted value either (a device known only via
+    // a durable `leases`/`clients` binding, never corroborated by any
+    // activity signal, correctly reads Removed rather than Active) — see
+    // [[device-recency-and-removal]].
+    let history_update = if device.wireguard_activity == WireGuardActivity::NotApplicable {
+        if neigh_vote || device.on_wifi {
+            device.last_seen = ctx.now;
+            Some((device.id.clone(), ctx.now))
+        } else {
+            device.last_seen = ctx.history.get(&device.id).copied().unwrap_or(std::time::UNIX_EPOCH);
+            None
+        }
+    } else {
+        None
+    };
+
+    Some((device, history_update))
 }
 
 #[cfg(test)]
@@ -375,7 +441,7 @@ mod tests {
             wan_address: None,
         };
 
-        let merged = merge_network_and_router(local, router);
+        let (merged, _history) = merge_network_and_router(local, router, &HashMap::new());
         assert_eq!(merged.devices.len(), 1);
         assert_eq!(merged.devices[0].hostname, Hostname::Resolved("new-name".to_string()));
     }
@@ -386,7 +452,7 @@ mod tests {
         let local = NetworkSnapshot::new(vec![], vec![local_device(ip, "AA:BB:CC:DD:EE:FF", "old-name", "eth0")], None, vec![]);
         let router = RouterSnapshot::default();
 
-        let merged = merge_network_and_router(local, router);
+        let (merged, _history) = merge_network_and_router(local, router, &HashMap::new());
         assert_eq!(merged.devices.len(), 1);
         assert_eq!(merged.devices[0].services.len(), 1);
         assert_eq!(merged.devices[0].hostname, Hostname::Resolved("old-name".to_string()));
@@ -401,14 +467,14 @@ mod tests {
             observations: vec![TieredObservation {
                 tier: RouterSourceTier::WireGuard,
                 observation: DeviceObservation::new(ip)
-                    .with_wireguard_public_key(WireGuardPublicKey::new("pubkey123".to_string()))
+                    .with_wireguard_activity(WireGuardPublicKey::new("pubkey123".to_string()), None)
                     .with_friendly_name(FriendlyName::new("Jamie phone".to_string())),
             }],
             wifi_clients: vec![],
             wan_address: None,
         };
 
-        let merged = merge_network_and_router(local, router);
+        let (merged, _history) = merge_network_and_router(local, router, &HashMap::new());
         assert_eq!(merged.devices.len(), 1);
         let device = &merged.devices[0];
         assert_eq!(device.mac, None);
@@ -427,16 +493,18 @@ mod tests {
             observations: vec![TieredObservation {
                 tier: RouterSourceTier::WireGuard,
                 observation: DeviceObservation::new(ip)
-                    .with_wireguard_public_key(WireGuardPublicKey::new("pubkey123".to_string()))
-                    .with_wireguard_latest_handshake(handshake),
+                    .with_wireguard_activity(WireGuardPublicKey::new("pubkey123".to_string()), Some(handshake)),
             }],
             wifi_clients: vec![],
             wan_address: None,
         };
 
-        let merged = merge_network_and_router(local, router);
+        let (merged, _history) = merge_network_and_router(local, router, &HashMap::new());
         assert_eq!(merged.devices.len(), 1);
-        assert_eq!(merged.devices[0].wireguard_latest_handshake, Some(handshake));
+        assert!(matches!(
+            &merged.devices[0].wireguard_activity,
+            crate::domain::WireGuardActivity::LastHandshake(_, t) if *t == handshake
+        ));
         assert_eq!(merged.devices[0].activity_status(), crate::domain::ActivityStatus::Active);
     }
 
@@ -466,7 +534,7 @@ mod tests {
             wan_address: None,
         };
 
-        let merged = merge_network_and_router(local, router);
+        let (merged, _history) = merge_network_and_router(local, router, &HashMap::new());
         assert_eq!(merged.devices.len(), 1);
         // DHCP lease's hostname wins despite being listed second...
         assert_eq!(merged.devices[0].hostname, Hostname::Resolved("known-host".to_string()));
@@ -497,7 +565,7 @@ mod tests {
             wan_address: None,
         };
 
-        let merged = merge_network_and_router(local, router);
+        let (merged, _history) = merge_network_and_router(local, router, &HashMap::new());
         assert_eq!(merged.devices.len(), 1);
         let device = &merged.devices[0];
         assert_eq!(device.addresses.len(), 2);
@@ -523,7 +591,7 @@ mod tests {
             wan_address: None,
         };
 
-        let merged = merge_network_and_router(local, router);
+        let (merged, _history) = merge_network_and_router(local, router, &HashMap::new());
         assert_eq!(merged.devices.len(), 0);
     }
 
@@ -538,14 +606,14 @@ mod tests {
             wan_address: Some(wan_address),
         };
 
-        let merged = merge_network_and_router(local, router);
+        let (merged, _history) = merge_network_and_router(local, router, &HashMap::new());
         assert_eq!(merged.wan_address, Some(wan_address));
     }
 
     #[test]
     fn test_merge_wan_address_absent_when_router_silent() {
         let local = NetworkSnapshot::new(vec![], vec![], None, vec![]);
-        let merged = merge_network_and_router(local, RouterSnapshot::default());
+        let (merged, _history) = merge_network_and_router(local, RouterSnapshot::default(), &HashMap::new());
         assert_eq!(merged.wan_address, None);
     }
 }

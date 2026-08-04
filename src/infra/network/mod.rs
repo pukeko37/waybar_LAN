@@ -3,6 +3,7 @@
 //! mDNS, reverse-DNS). Implements `app::NetworkFetcher`.
 
 pub mod collector;
+pub mod history;
 pub mod mdns_discovery;
 pub mod models;
 pub mod proc_parsers;

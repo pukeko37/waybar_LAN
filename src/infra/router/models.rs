@@ -180,14 +180,11 @@ pub fn parse_wireguard(wg_dump_output: &str, wg_peers_output: &str) -> Result<Ve
                 .into_iter()
                 .map(move |ip| {
                     let mut observation = DeviceObservation::new(ip)
-                        .with_wireguard_public_key(public_key.clone());
+                        .with_wireguard_activity(public_key.clone(), latest_handshake);
                     if let Some(name) = &friendly_name {
                         observation = observation.with_friendly_name(
                             crate::domain::FriendlyName::new(name.clone()),
                         );
-                    }
-                    if let Some(latest_handshake) = latest_handshake {
-                        observation = observation.with_wireguard_latest_handshake(latest_handshake);
                     }
                     TieredObservation {
                         tier: RouterSourceTier::WireGuard,
@@ -394,7 +391,7 @@ BowersNet\t+mP28ziwQ2zZqlBBfYI5xDA3djASAQ66jJqa9osDCxk=\t(none)\t192.168.1.122:5
             .find(|o| o.observation.ip == "10.20.30.3".parse::<IpAddr>().unwrap())
             .unwrap();
         assert_eq!(
-            jamie_phone.observation.wireguard_public_key.as_ref().map(|k| k.as_str()),
+            jamie_phone.observation.wireguard_activity.public_key().map(|k| k.as_str()),
             Some("gN4DvXs/DP060P0yLzfTYBMqUAh/qHznuPHw1vOfCUg=")
         );
         assert_eq!(
@@ -411,16 +408,20 @@ BowersNet\t+mP28ziwQ2zZqlBBfYI5xDA3djASAQ66jJqa9osDCxk=\t(none)\t192.168.1.122:5
             .iter()
             .find(|o| o.observation.ip == "10.20.30.3".parse::<IpAddr>().unwrap())
             .unwrap();
-        assert_eq!(jamie_phone.observation.wireguard_latest_handshake, None);
+        assert!(matches!(
+            jamie_phone.observation.wireguard_activity,
+            crate::domain::WireGuardActivity::Never(_)
+        ));
 
         let andrew_iphone = observations
             .iter()
             .find(|o| o.observation.ip == "10.20.30.13".parse::<IpAddr>().unwrap())
             .unwrap();
-        assert_eq!(
-            andrew_iphone.observation.wireguard_latest_handshake,
-            Some(UNIX_EPOCH + Duration::from_secs(1785651044))
-        );
+        assert!(matches!(
+            &andrew_iphone.observation.wireguard_activity,
+            crate::domain::WireGuardActivity::LastHandshake(_, t)
+                if *t == UNIX_EPOCH + Duration::from_secs(1785651044)
+        ));
     }
 
     #[test]

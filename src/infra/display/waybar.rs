@@ -29,6 +29,13 @@ fn pango_color(status: ActivityStatus) -> (&'static str, &'static str) {
         ActivityStatus::Recent => ("<span color='#FFFF00'>", "</span>"), // Yellow
         ActivityStatus::Idle => ("", ""),                                // White (default)
         ActivityStatus::Stale => ("<span color='#888888'>", "</span>"), // Grey
+        // Removed devices are filtered out of the tooltip before rendering
+        // (see WaybarFormatter::format) — this arm should be unreachable in
+        // practice. Rust's exhaustiveness check still requires it, so it's
+        // handled the same as Stale rather than with `unreachable!()`: if
+        // the filter and this match ever drift apart, a grey fallback is
+        // the safe failure for a UI widget, not a panic.
+        ActivityStatus::Removed => ("<span color='#888888'>", "</span>"),
     }
 }
 
@@ -158,6 +165,19 @@ impl WaybarFormatter {
             .collect()
     }
 
+    /// Drops any device whose `activity_status()` is `Removed` — not seen
+    /// (or, for WireGuard, never handshaked) within the last 24 hours, per
+    /// [[device-recency-and-removal]]. No "recently removed" grace state:
+    /// a `Removed` device is simply absent from the output, same treatment
+    /// as `filter_to_private_devices` above.
+    fn filter_to_active_devices(&self, devices: &[NetworkDevice]) -> Vec<NetworkDevice> {
+        devices
+            .iter()
+            .filter(|device| device.activity_status() != ActivityStatus::Removed)
+            .cloned()
+            .collect()
+    }
+
     /// Builds the tooltip: a brief preamble listing this host's own local
     /// interfaces (informational only, not a grouping mechanism — see
     /// [[flat-device-list-display]]), followed by a two-level device tree
@@ -250,13 +270,22 @@ impl WaybarFormatter {
         lines
     }
 
-    /// Access path for a device — e.g. `via eno1` when a `DeviceAddress`
-    /// carries a local `interface_name`, `via WireGuard` when only a
+    /// Access path for a device — `via Wi-Fi` when tagged by a `clients`
+    /// (assoclist) MAC match, `via eno1` when a `DeviceAddress` carries a
+    /// local `interface_name`, `via WireGuard` when only a
     /// WireGuard-key-correlated address is known. No heuristic guessing
     /// beyond what the device's own fields state directly, per
     /// [[flat-device-list-display]]. Since [[nested-tree-by-access-path]],
     /// this value becomes a group heading rather than inline per-row text.
+    /// `on_wifi` is checked first: per [[device-recency-and-removal]], it
+    /// shouldn't collide with the other two in practice (`interface_name`
+    /// only ever comes from a *locally* observed address, `clients` only
+    /// ever tags router-sourced devices), but takes precedence if a future
+    /// source ever makes more than one true for the same device.
     fn access_path_annotation(&self, device: &crate::domain::NetworkDevice) -> Option<String> {
+        if device.on_wifi {
+            return Some("via Wi-Fi".to_string());
+        }
         if let Some(name) = device.addresses.iter().find_map(|a| a.interface_name.as_ref()) {
             return Some(format!("via {}", name));
         }
@@ -386,6 +415,7 @@ impl NetworkFormatter for WaybarFormatter {
     fn format(&self, network_data: &NetworkData) -> Result<WaybarOutput> {
         let mut network_data = network_data.clone();
         network_data.devices = self.filter_to_private_devices(&network_data.devices);
+        network_data.devices = self.filter_to_active_devices(&network_data.devices);
         let network_data = &network_data;
 
         let device_count = network_data.devices.len();
@@ -527,6 +557,44 @@ mod tests {
         assert_eq!(output.text, "🖧 2 devices");
         assert!(output.tooltip.contains("10.20.30.3"));
         assert!(output.tooltip.contains("via WireGuard"));
+    }
+
+    #[test]
+    fn test_format_drops_never_handshaked_wireguard_device() {
+        // Regression test for the bug motivating [[device-recency-and-removal]]:
+        // a never-handshaked WireGuard peer must not appear in the tooltip
+        // or device count at all, not merely render grey.
+        let formatter = WaybarFormatter::new();
+        let peer_ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
+        let key = crate::domain::WireGuardPublicKey::new("pubkey123".to_string());
+        let peer_address = crate::domain::DeviceAddress { ip: peer_ip, interface_name: None };
+        let mut peer = NetworkDevice::new(crate::domain::DeviceId::WireGuardKey(key.clone()), vec![peer_address], None);
+        peer.wireguard_activity = crate::domain::WireGuardActivity::Never(key);
+
+        let data = NetworkData::new(vec![], vec![peer], None, vec![]);
+        let output = formatter.format(&data).unwrap();
+
+        assert_eq!(output.text, "🖧 No devices");
+        assert!(!output.tooltip.contains("10.20.30.3"));
+    }
+
+    #[test]
+    fn test_format_groups_wifi_tagged_device_under_via_wifi() {
+        let formatter = WaybarFormatter::new();
+        let local_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        let local_mac = MacAddress::new("11:22:33:44:55:66".to_string()).unwrap();
+        let interface = NetworkInterface::new(crate::domain::InterfaceName::new("eth0".to_string()), local_ip, Some(local_mac));
+
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 77));
+        let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
+        let address = crate::domain::DeviceAddress { ip, interface_name: None };
+        let mut device = NetworkDevice::new(crate::domain::DeviceId::Mac(mac.clone()), vec![address], Some(mac));
+        device.on_wifi = true;
+
+        let data = NetworkData::new(vec![interface], vec![device], None, vec![]);
+        let output = formatter.format(&data).unwrap();
+
+        assert!(output.tooltip.contains("via Wi-Fi"));
     }
 
     #[test]

@@ -6,10 +6,10 @@
 
 use anyhow::Result;
 use std::path::PathBuf;
-use waybar_lan::app::{merge_network_and_router, NetworkFetcher, NetworkFormatter, RouterFetcher};
+use waybar_lan::app::{merge_network_and_router, NetworkFetcher, NetworkFormatter, RouterFetcher, RouterSnapshot};
 use waybar_lan::infra::display::WaybarFormatter;
 use waybar_lan::infra::dump;
-use waybar_lan::infra::network::NetworkCollector;
+use waybar_lan::infra::network::{history, NetworkCollector};
 use waybar_lan::infra::router::SshRouterFetcher;
 
 /// Configuration parsed from command line arguments
@@ -123,19 +123,31 @@ fn main() -> Result<()> {
             collector.collect()
         });
 
-    // Router presence is binary: unset WAYBAR_LAN_ROUTER is a zero-behavioural-change
-    // path (no SSH attempted); set-but-unreachable is a full collection failure, not a
-    // silent fallback to local-only data.
-    let network_data = network_data.and_then(|data| match std::env::var("WAYBAR_LAN_ROUTER") {
-        Ok(host) => {
-            let router_snapshot = SshRouterFetcher::new(host).collect()?;
-            Ok(merge_network_and_router(data, router_snapshot))
-        }
-        Err(_) => Ok(data),
+    // Router presence is binary: unset WAYBAR_LAN_ROUTER means no SSH is
+    // attempted; set-but-unreachable is a full collection failure, not a
+    // silent fallback to local-only data. The merge/history step below
+    // always runs regardless of router presence — per
+    // [[device-recency-and-removal]], that's what makes the persisted
+    // last-observed/`Removed` treatment apply uniformly to every source,
+    // not just to router users.
+    let history_path = history::default_path();
+    let loaded_history = history_path.as_deref().map(history::load).unwrap_or_default();
+
+    let network_data = network_data.and_then(|data| {
+        let router_snapshot = match std::env::var("WAYBAR_LAN_ROUTER") {
+            Ok(host) => SshRouterFetcher::new(host).collect()?,
+            Err(_) => RouterSnapshot::default(),
+        };
+        Ok(merge_network_and_router(data, router_snapshot, &loaded_history))
     });
 
     match network_data {
-        Ok(data) => {
+        Ok((data, updated_history)) => {
+            if let Some(path) = &history_path {
+                // Best-effort: a failed write shouldn't block the widget
+                // from rendering output it has already computed.
+                let _ = history::save(path, &updated_history);
+            }
             let output = formatter.format(&data)?;
             println!("{}", serde_json::to_string(&output)?);
         }
