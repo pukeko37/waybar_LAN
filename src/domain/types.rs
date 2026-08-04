@@ -597,18 +597,20 @@ impl NetworkDevice {
     }
 
     /// Update last seen time to now
-    pub fn update_last_seen(&mut self) {
+    pub fn update_last_seen(mut self) -> Self {
         self.last_seen = SystemTime::now();
+        self
     }
 
     /// Build DeviceIdentity from collected information
     /// Uses priority-based inference for device type, manufacturer, and friendly name
-    pub fn build_identity(&mut self) {
+    pub fn build_identity(mut self) -> Self {
         self.identity = DeviceIdentity {
             device_type: self.infer_device_type(),
             manufacturer: self.extract_manufacturer(),
             friendly_name: self.extract_friendly_name(),
         };
+        self
     }
 
     /// Infer device type from available information

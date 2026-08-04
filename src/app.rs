@@ -341,7 +341,7 @@ fn build_device(cluster_ips: Vec<IpAddr>, ctx: &BuildContext) -> Option<(Network
     device.wireguard_activity = wireguard_activity.unwrap_or(WireGuardActivity::NotApplicable);
     device.on_wifi = mac.is_some_and(|m| ctx.wifi_clients.contains(&m));
 
-    device.build_identity();
+    device = device.build_identity();
     if let Some(friendly_name) = friendly_name {
         device.identity.friendly_name = Some(friendly_name);
     }

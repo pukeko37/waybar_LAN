@@ -507,8 +507,7 @@ mod tests {
 
         let interface = NetworkInterface::new(crate::domain::InterfaceName::new("eth0".to_string()), ip1, Some(mac1.clone()));
         let device = local_device(ip2, mac2, "eth0");
-        let mut router = local_device(gateway_ip, mac3, "eth0");
-        router.build_identity(); // Build identity so it shows as "Router"
+        let router = local_device(gateway_ip, mac3, "eth0").build_identity(); // Build identity so it shows as "Router"
 
         let gateway = Gateway::new(gateway_ip);
 
@@ -682,8 +681,7 @@ mod tests {
         let gateway_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
         let mac = MacAddress::new("00:11:22:33:44:55".to_string()).unwrap();
         let address = crate::domain::DeviceAddress { ip: gateway_ip, interface_name: Some(crate::domain::InterfaceName::new("eth0".to_string())) };
-        let mut router = NetworkDevice::new(crate::domain::DeviceId::Mac(mac.clone()), vec![address], Some(mac));
-        router.build_identity();
+        let router = NetworkDevice::new(crate::domain::DeviceId::Mac(mac.clone()), vec![address], Some(mac)).build_identity();
 
         let wan_address = crate::domain::WanAddress::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)));
         let interface = NetworkInterface::new(crate::domain::InterfaceName::new("eth0".to_string()), gateway_ip, None);

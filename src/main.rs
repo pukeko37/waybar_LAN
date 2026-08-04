@@ -141,21 +141,34 @@ fn main() -> Result<()> {
         Ok(merge_network_and_router(data, router_snapshot, &loaded_history))
     });
 
-    match network_data {
-        Ok((data, updated_history)) => {
+    // Every path from here to stdout funnels through create_error_output on
+    // failure — formatting and JSON-serialization errors get the same
+    // "always emit valid JSON" treatment collection errors already had.
+    // Config::from_args()'s own failure (a misconfigured Waybar exec line,
+    // not a runtime condition) deliberately still exits loudly instead —
+    // see [[main-module-rules]].
+    let output_json = network_data
+        .and_then(|(data, updated_history)| {
             if let Some(path) = &history_path {
                 // Best-effort: a failed write shouldn't block the widget
                 // from rendering output it has already computed.
                 let _ = history::save(path, &updated_history);
             }
-            let output = formatter.format(&data)?;
-            println!("{}", serde_json::to_string(&output)?);
-        }
-        Err(e) => {
-            let error_output = WaybarFormatter::create_error_output(e);
-            println!("{}", serde_json::to_string(&error_output)?);
-        }
-    }
+            formatter.format(&data)
+        })
+        .map_or_else(
+            |e| serde_json::to_string(&WaybarFormatter::create_error_output(e)),
+            |output| serde_json::to_string(&output),
+        );
+
+    // Safety: if even the error payload fails to serialize, something is
+    // badly wrong beyond what create_error_output can express — fall back
+    // to a hardcoded literal rather than propagate and break the "always
+    // valid JSON" contract on the very last line able to honour it.
+    println!(
+        "{}",
+        output_json.unwrap_or_else(|_| r#"{"text":"🖧 error","tooltip":"internal error"}"#.to_string())
+    );
 
     Ok(())
 }

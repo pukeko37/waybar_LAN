@@ -131,7 +131,7 @@ impl NetworkCollector {
                 let device_ip = device.primary_address();
                 if let Some(services) = mdns_services.get(&device_ip) {
                     device.services = services.clone();
-                    device.update_last_seen();
+                    device = device.update_last_seen();
 
                     // Extract hostname from mDNS instance name (e.g., "hostname.local.")
                     if let Some(service) = services.first()
@@ -178,8 +178,7 @@ impl NetworkCollector {
                     };
 
                     // Build device identity
-                    device.build_identity();
-                    device
+                    device.build_identity()
                 })
                 .collect()
         };
