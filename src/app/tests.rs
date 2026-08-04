@@ -1,0 +1,243 @@
+use super::*;
+use crate::infra::display::WaybarFormatter;
+
+struct StubNetworkFetcher {
+    succeed: bool,
+}
+
+impl NetworkFetcher for StubNetworkFetcher {
+    fn collect(&self) -> Result<NetworkSnapshot, anyhow::Error> {
+        if self.succeed {
+            Ok(NetworkSnapshot::new(vec![], vec![], None, vec![]))
+        } else {
+            Err(anyhow::anyhow!("collection failed"))
+        }
+    }
+}
+
+#[test]
+fn test_fetch_and_format_success() {
+    let fetcher = StubNetworkFetcher { succeed: true };
+    let formatter = WaybarFormatter::new();
+
+    let output = fetch_and_format(&fetcher, &formatter).unwrap();
+
+    assert_eq!(output.text, "🖧 No devices");
+}
+
+#[test]
+fn test_fetch_and_format_error() {
+    let fetcher = StubNetworkFetcher { succeed: false };
+    let formatter = WaybarFormatter::new();
+
+    let result = fetch_and_format(&fetcher, &formatter);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().to_string().contains("collection failed"));
+}
+
+use crate::domain::{FriendlyName, InterfaceName, NeighborState};
+
+fn local_device(ip: IpAddr, mac: &str, hostname: &str, interface: &str) -> NetworkDevice {
+    let mac = MacAddress::new(mac.to_string()).unwrap();
+    let address = DeviceAddress { ip, interface_name: Some(InterfaceName::new(interface.to_string())) };
+    let mut device = NetworkDevice::new(DeviceId::Mac(mac.clone()), vec![address], Some(mac));
+    device.hostname = Hostname::resolved(hostname.to_string());
+    device.services.push(crate::domain::ServiceInfo::new(
+        crate::domain::ServiceType::new("_ssh._tcp.local.".to_string()),
+        crate::domain::ServiceInstanceName::new("my-nas".to_string()),
+        22,
+    ));
+    device
+}
+
+#[test]
+fn test_merge_router_hostname_overrides_local() {
+    let ip: IpAddr = "192.168.1.50".parse().unwrap();
+    let local = NetworkSnapshot::new(vec![], vec![local_device(ip, "AA:BB:CC:DD:EE:FF", "old-name", "eth0")], None, vec![]);
+
+    let router = RouterSnapshot {
+        observations: vec![TieredObservation {
+            tier: RouterSourceTier::DhcpLease,
+            observation: DeviceObservation::new(ip)
+                .with_mac(MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap())
+                .with_hostname("new-name".to_string()),
+        }],
+        wifi_clients: vec![],
+        wan_address: None,
+    };
+
+    let (merged, _history) = merge_network_and_router(local, router, &HashMap::new());
+    assert_eq!(merged.devices.len(), 1);
+    assert_eq!(merged.devices[0].hostname, Hostname::Resolved("new-name".to_string()));
+}
+
+#[test]
+fn test_merge_preserves_local_services_and_falls_back_when_router_silent() {
+    let ip: IpAddr = "192.168.1.50".parse().unwrap();
+    let local = NetworkSnapshot::new(vec![], vec![local_device(ip, "AA:BB:CC:DD:EE:FF", "old-name", "eth0")], None, vec![]);
+    let router = RouterSnapshot::default();
+
+    let (merged, _history) = merge_network_and_router(local, router, &HashMap::new());
+    assert_eq!(merged.devices.len(), 1);
+    assert_eq!(merged.devices[0].services.len(), 1);
+    assert_eq!(merged.devices[0].hostname, Hostname::Resolved("old-name".to_string()));
+}
+
+#[test]
+fn test_merge_creates_router_only_device_for_wireguard_peer_with_no_local_presence() {
+    let ip: IpAddr = "10.20.30.3".parse().unwrap();
+    let local = NetworkSnapshot::new(vec![], vec![], None, vec![]);
+
+    let router = RouterSnapshot {
+        observations: vec![TieredObservation {
+            tier: RouterSourceTier::WireGuard,
+            observation: DeviceObservation::new(ip)
+                .with_wireguard_activity(WireGuardPublicKey::new("pubkey123".to_string()), None)
+                .with_friendly_name(FriendlyName::new("Jamie phone".to_string())),
+        }],
+        wifi_clients: vec![],
+        wan_address: None,
+    };
+
+    let (merged, _history) = merge_network_and_router(local, router, &HashMap::new());
+    assert_eq!(merged.devices.len(), 1);
+    let device = &merged.devices[0];
+    assert_eq!(device.mac, None);
+    assert_eq!(device.id, DeviceId::WireGuardKey(WireGuardPublicKey::new("pubkey123".to_string())));
+    assert!(device.addresses.iter().all(|a| a.interface_name.is_none()));
+    assert_eq!(device.identity.friendly_name, Some(FriendlyName::new("Jamie phone".to_string())));
+}
+
+#[test]
+fn test_merge_carries_wireguard_latest_handshake_onto_device() {
+    let ip: IpAddr = "10.20.30.3".parse().unwrap();
+    let local = NetworkSnapshot::new(vec![], vec![], None, vec![]);
+    let handshake = std::time::SystemTime::now() - std::time::Duration::from_secs(30);
+
+    let router = RouterSnapshot {
+        observations: vec![TieredObservation {
+            tier: RouterSourceTier::WireGuard,
+            observation: DeviceObservation::new(ip)
+                .with_wireguard_activity(WireGuardPublicKey::new("pubkey123".to_string()), Some(handshake)),
+        }],
+        wifi_clients: vec![],
+        wan_address: None,
+    };
+
+    let (merged, _history) = merge_network_and_router(local, router, &HashMap::new());
+    assert_eq!(merged.devices.len(), 1);
+    assert!(matches!(
+        &merged.devices[0].wireguard_activity,
+        crate::domain::WireGuardActivity::LastHandshake(_, t) if *t == handshake
+    ));
+    assert_eq!(merged.devices[0].activity_status(), crate::domain::ActivityStatus::Active);
+}
+
+#[test]
+fn test_merge_priority_order_dhcp_lease_beats_neighbor_table() {
+    let ip: IpAddr = "192.168.1.60".parse().unwrap();
+    let local = NetworkSnapshot::new(vec![], vec![], None, vec![]);
+
+    let dhcp_mac = MacAddress::new("AA:AA:AA:AA:AA:AA".to_string()).unwrap();
+
+    let router = RouterSnapshot {
+        observations: vec![
+            TieredObservation {
+                tier: RouterSourceTier::NeighborTable,
+                observation: DeviceObservation::new(ip)
+                    .with_mac(dhcp_mac.clone())
+                    .with_neighbor_state(NeighborState::Reachable),
+            },
+            TieredObservation {
+                tier: RouterSourceTier::DhcpLease,
+                observation: DeviceObservation::new(ip)
+                    .with_mac(dhcp_mac.clone())
+                    .with_hostname("known-host".to_string()),
+            },
+        ],
+        wifi_clients: vec![],
+        wan_address: None,
+    };
+
+    let (merged, _history) = merge_network_and_router(local, router, &HashMap::new());
+    assert_eq!(merged.devices.len(), 1);
+    // DHCP lease's hostname wins despite being listed second...
+    assert_eq!(merged.devices[0].hostname, Hostname::Resolved("known-host".to_string()));
+    // ...while neighbor_state, which only the lower-priority tier
+    // reported, still comes through via the fallback.
+    assert_eq!(merged.devices[0].neighbor_state, NeighborState::Reachable);
+}
+
+#[test]
+fn test_merge_correlates_dual_homed_device_across_two_addresses_by_mac() {
+    // Same physical device, seen locally on eno1 at one address, and
+    // reported by the router's neighbour table at a *different*
+    // address (e.g. an IPv6 link-local address) sharing the same MAC —
+    // per [[device-catalogue-identity]], this collapses into one
+    // device with two addresses, not two devices.
+    let lan_ip: IpAddr = "192.168.1.50".parse().unwrap();
+    let link_local_ip: IpAddr = "fe80::1".parse().unwrap();
+    let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
+
+    let local = NetworkSnapshot::new(vec![], vec![local_device(lan_ip, "AA:BB:CC:DD:EE:FF", "desktop", "eno1")], None, vec![]);
+
+    let router = RouterSnapshot {
+        observations: vec![TieredObservation {
+            tier: RouterSourceTier::NeighborTable,
+            observation: DeviceObservation::new(link_local_ip).with_mac(mac),
+        }],
+        wifi_clients: vec![],
+        wan_address: None,
+    };
+
+    let (merged, _history) = merge_network_and_router(local, router, &HashMap::new());
+    assert_eq!(merged.devices.len(), 1);
+    let device = &merged.devices[0];
+    assert_eq!(device.addresses.len(), 2);
+    assert!(device.addresses.iter().any(|a| a.ip == lan_ip));
+    assert!(device.addresses.iter().any(|a| a.ip == link_local_ip));
+}
+
+#[test]
+fn test_merge_drops_signal_less_neighbor_only_clusters() {
+    // A bare `neigh` entry with no `lladdr` at all — the kernel's own
+    // incomplete/failed ARP entry, not a real device — carries no mac,
+    // no wireguard_public_key, and no hostname. It must not appear in
+    // the merged output.
+    let ip: IpAddr = "192.168.1.99".parse().unwrap();
+    let local = NetworkSnapshot::new(vec![], vec![], None, vec![]);
+
+    let router = RouterSnapshot {
+        observations: vec![TieredObservation {
+            tier: RouterSourceTier::NeighborTable,
+            observation: DeviceObservation::new(ip).with_neighbor_state(NeighborState::Failed),
+        }],
+        wifi_clients: vec![],
+        wan_address: None,
+    };
+
+    let (merged, _history) = merge_network_and_router(local, router, &HashMap::new());
+    assert_eq!(merged.devices.len(), 0);
+}
+
+#[test]
+fn test_merge_carries_router_wan_address_onto_snapshot() {
+    let local = NetworkSnapshot::new(vec![], vec![], None, vec![]);
+    let wan_address = WanAddress::new("203.0.113.7".parse().unwrap());
+
+    let router = RouterSnapshot {
+        observations: vec![],
+        wifi_clients: vec![],
+        wan_address: Some(wan_address),
+    };
+
+    let (merged, _history) = merge_network_and_router(local, router, &HashMap::new());
+    assert_eq!(merged.wan_address, Some(wan_address));
+}
+
+#[test]
+fn test_merge_wan_address_absent_when_router_silent() {
+    let local = NetworkSnapshot::new(vec![], vec![], None, vec![]);
+    let (merged, _history) = merge_network_and_router(local, RouterSnapshot::default(), &HashMap::new());
+    assert_eq!(merged.wan_address, None);
+}

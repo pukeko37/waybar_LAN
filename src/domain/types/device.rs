@@ -1,136 +1,12 @@
-//! Type-safe domain models for network monitoring.
-//!
-//! This module contains value objects that enforce invariants at compile time:
-//! - All primitives are wrapped in semantic newtypes
-//! - Validation happens at construction time
-//! - Invalid states are unrepresentable
+//! The device entity: its identity, its data model, and its state enums.
+//! Heuristic identity inference (`build_identity` and friends) lives in the
+//! sibling `inference` module, as a second `impl NetworkDevice` block.
 
-use crate::domain::error::NetworkError;
+use super::values::{FriendlyName, InterfaceName, MacAddress, ManufacturerName, ServiceInstanceName, ServiceType, WireGuardPublicKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
-
-/// Validated MAC address
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct MacAddress(String);
-
-impl MacAddress {
-    /// Creates a new MacAddress from a string
-    /// Accepts formats: AA:BB:CC:DD:EE:FF, aa:bb:cc:dd:ee:ff, AA-BB-CC-DD-EE-FF
-    pub fn new(mac: String) -> Result<Self, NetworkError> {
-        let normalized = mac.to_uppercase().replace('-', ":");
-
-        // Basic validation: should be 17 chars with colons
-        if normalized.len() != 17 {
-            return Err(NetworkError::InvalidMacLength(mac));
-        }
-
-        let parts: Vec<&str> = normalized.split(':').collect();
-        if parts.len() != 6 {
-            return Err(NetworkError::InvalidMacFormat(mac));
-        }
-
-        // Validate each octet is valid hex
-        for part in &parts {
-            if part.len() != 2 || u8::from_str_radix(part, 16).is_err() {
-                return Err(NetworkError::InvalidMacOctet((*part).to_string()));
-            }
-        }
-
-        Ok(Self(normalized))
-    }
-}
-
-impl fmt::Display for MacAddress {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// mDNS service type (e.g., "_airplay._tcp.local.")
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ServiceType(String);
-
-impl ServiceType {
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ServiceType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// mDNS service instance name
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ServiceInstanceName(String);
-
-impl ServiceInstanceName {
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ServiceInstanceName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Manufacturer name (e.g., "Samsung", "Brother")
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManufacturerName(String);
-
-impl ManufacturerName {
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// User-friendly device name
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct FriendlyName(String);
-
-impl FriendlyName {
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// Network interface name (e.g., "eth0", "wlan0")
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct InterfaceName(String);
-
-impl InterfaceName {
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl fmt::Display for InterfaceName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
 
 /// Hostname resolution state
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +17,26 @@ pub enum Hostname {
     Resolved(String),
     /// DNS lookup failed or timed out
     Unknown,
+}
+
+impl Hostname {
+    pub fn resolved(name: String) -> Self {
+        if name.is_empty() {
+            Self::Unknown
+        } else {
+            Self::Resolved(name)
+        }
+    }
+}
+
+impl fmt::Display for Hostname {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Hostname::Resolving => write!(f, "Resolving..."),
+            Hostname::Resolved(name) => write!(f, "{}", name),
+            Hostname::Unknown => write!(f, "Unknown"),
+        }
+    }
 }
 
 /// mDNS service information
@@ -279,26 +175,6 @@ impl ActivityStatus {
     }
 }
 
-impl Hostname {
-    pub fn resolved(name: String) -> Self {
-        if name.is_empty() {
-            Self::Unknown
-        } else {
-            Self::Resolved(name)
-        }
-    }
-}
-
-impl fmt::Display for Hostname {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Hostname::Resolving => write!(f, "Resolving..."),
-            Hostname::Resolved(name) => write!(f, "{}", name),
-            Hostname::Unknown => write!(f, "Unknown"),
-        }
-    }
-}
-
 /// Device type classification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DeviceType {
@@ -363,29 +239,6 @@ impl DeviceIdentity {
 impl Default for DeviceIdentity {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-/// A WireGuard peer's public key. WireGuard peers have no MAC address (a
-/// WireGuard tunnel is Layer-3-only — there is no Ethernet frame to carry
-/// one), so this is the strongest identity/correlation signal available for
-/// them, per [[device-catalogue-identity]].
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct WireGuardPublicKey(String);
-
-impl WireGuardPublicKey {
-    pub fn new(value: String) -> Self {
-        Self(value)
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for WireGuardPublicKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
     }
 }
 
@@ -601,296 +454,13 @@ impl NetworkDevice {
         self.last_seen = SystemTime::now();
         self
     }
-
-    /// Build DeviceIdentity from collected information
-    /// Uses priority-based inference for device type, manufacturer, and friendly name
-    pub fn build_identity(mut self) -> Self {
-        self.identity = DeviceIdentity {
-            device_type: self.infer_device_type(),
-            manufacturer: self.extract_manufacturer(),
-            friendly_name: self.extract_friendly_name(),
-        };
-        self
-    }
-
-    /// Infer device type from available information
-    fn infer_device_type(&self) -> DeviceType {
-        self.infer_from_services()
-            .or_else(|| self.infer_from_manufacturer_and_model())
-            .or_else(|| self.infer_from_hostname())
-            .unwrap_or(DeviceType::Unknown)
-    }
-
-    /// Infer device type from mDNS service types
-    fn infer_from_services(&self) -> Option<DeviceType> {
-        if self.has_service("_printer") || self.has_service("_ipp") {
-            return Some(DeviceType::Printer);
-        }
-        if self.has_service("_googlecast")
-            || (self.has_service("_airplay") && self.has_service("_spotify-connect")) {
-            return Some(DeviceType::Television);
-        }
-        if self.has_service("_raop") && !self.has_service("_airplay") {
-            return Some(DeviceType::Speaker);
-        }
-        if self.has_service("_ssh") && self.has_service("_smb") {
-            return Some(DeviceType::NAS);
-        }
-        if self.has_service("_homekit") {
-            return Some(DeviceType::SmartHome);
-        }
-        None
-    }
-
-    /// Infer device type from manufacturer and model with service heuristics
-    fn infer_from_manufacturer_and_model(&self) -> Option<DeviceType> {
-        let manufacturer_from_hostname = if let Hostname::Resolved(hostname) = &self.hostname {
-            Some(hostname.to_lowercase())
-        } else {
-            None
-        };
-
-        // Check for TV brands with media services
-        let is_tv_brand = |name: &str| {
-            name.contains("samsung") || name.contains("lg") || name.contains("sony")
-                || name.contains("vizio") || name.contains("tcl") || name.contains("hisense")
-        };
-        let has_tv_brand = manufacturer_from_hostname.as_ref().map(|m| is_tv_brand(m)).unwrap_or(false);
-
-        if has_tv_brand && (self.has_service("_airplay") || self.has_service("_googlecast")
-            || self.has_service("_spotify-connect") || self.has_service("_raop")) {
-            return Some(DeviceType::Television);
-        }
-
-        // Check for printer brands
-        let is_printer_brand = |name: &str| {
-            name.contains("brother") || name.contains("hp") || name.contains("canon")
-                || name.contains("epson") || name.contains("xerox")
-        };
-        let has_printer_brand = manufacturer_from_hostname.as_ref().map(|m| is_printer_brand(m)).unwrap_or(false);
-
-        if has_printer_brand {
-            return Some(DeviceType::Printer);
-        }
-
-        // Check for NAS manufacturers in hostname
-        if let Some(hostname) = &manufacturer_from_hostname
-            && (hostname.contains("synology") || hostname.contains("qnap"))
-        {
-            return Some(DeviceType::NAS);
-        }
-
-        None
-    }
-
-    /// Infer device type from hostname patterns
-    fn infer_from_hostname(&self) -> Option<DeviceType> {
-        let Hostname::Resolved(hostname) = &self.hostname else { return None };
-        let hostname_lower = hostname.to_lowercase();
-
-        if hostname_lower.contains("router") || hostname_lower.contains("gateway") {
-            return Some(DeviceType::Router);
-        }
-        if hostname_lower.contains("nas") {
-            return Some(DeviceType::NAS);
-        }
-        if hostname_lower.contains("printer") {
-            return Some(DeviceType::Printer);
-        }
-        // Check for tablets before phones (since "Galaxy Tab" contains "galaxy")
-        if hostname_lower.contains("ipad") || hostname_lower.contains("tablet")
-            || hostname_lower.contains("-tab-") || hostname_lower.contains(" tab ")
-            || hostname_lower.starts_with("tab") {
-            return Some(DeviceType::Tablet);
-        }
-        if hostname_lower.contains("iphone") || hostname_lower.contains("galaxy")
-            || hostname_lower.contains("pixel") {
-            return Some(DeviceType::MobileDevice);
-        }
-        None
-    }
-
-    /// Extract manufacturer from available sources
-    fn extract_manufacturer(&self) -> Option<ManufacturerName> {
-        // Extract from hostname
-        if let Hostname::Resolved(hostname) = &self.hostname {
-            let hostname_lower = hostname.to_lowercase();
-            let known_manufacturers = ["samsung", "lg", "sony", "brother", "hp",
-                                      "canon", "epson", "apple", "google", "amazon"];
-            for mfr in &known_manufacturers {
-                if hostname_lower.contains(mfr) {
-                    // Capitalize first letter
-                    let capitalized = format!("{}{}",
-                        mfr[0..1].to_uppercase(),
-                        &mfr[1..]);
-                    return Some(ManufacturerName::new(capitalized));
-                }
-            }
-        }
-
-        None
-    }
-
-    /// Extract friendly name from available sources
-    fn extract_friendly_name(&self) -> Option<FriendlyName> {
-        // DNS hostname (if available and descriptive)
-        if let Hostname::Resolved(hostname) = &self.hostname
-            && !hostname.is_empty() && !hostname.starts_with('_')
-        {
-            return Some(FriendlyName::new(hostname.clone()));
-        }
-
-        None
-    }
-
-    /// Check if device has a specific mDNS service (case-insensitive partial match)
-    fn has_service(&self, service_type: &str) -> bool {
-        self.services.iter().any(|s|
-            s.service_type.as_str().to_lowercase().contains(&service_type.to_lowercase())
-        )
-    }
 }
-
-/// Network interface on this machine
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NetworkInterface {
-    pub name: InterfaceName,
-    pub ip: IpAddr,
-    pub mac: Option<MacAddress>,
-}
-
-impl NetworkInterface {
-    pub fn new(name: InterfaceName, ip: IpAddr, mac: Option<MacAddress>) -> Self {
-        Self { name, ip, mac }
-    }
-}
-
-/// Default gateway address
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct Gateway(pub IpAddr);
-
-impl Gateway {
-    pub fn new(ip: IpAddr) -> Self {
-        Self(ip)
-    }
-}
-
-impl fmt::Display for Gateway {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// The router's external (WAN-side) address, as reported by the router
-/// itself over SSH — see [[wan-ip-display]]. Mirrors `Gateway`'s shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WanAddress(pub IpAddr);
-
-impl WanAddress {
-    pub fn new(ip: IpAddr) -> Self {
-        Self(ip)
-    }
-}
-
-impl fmt::Display for WanAddress {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Whether an address is a private (RFC1918 IPv4) or IPv6 Unique Local
-/// Address (`fc00::/7`). IPv6 link-local (`fe80::/10`) deliberately returns
-/// `false` here — per [[private-address-only-display]], it isn't treated as
-/// private for this widget's purposes. A pure classification fact, not a
-/// filtering policy — see that decision for where the policy of what to do
-/// with a non-private address lives.
-pub fn is_private_address(ip: &IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_private(),
-        IpAddr::V6(v6) => {
-            let octets = v6.octets();
-            (octets[0] & 0xfe) == 0xfc
-        }
-    }
-}
-
-/// Complete network snapshot at a point in time
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NetworkSnapshot {
-    pub interfaces: Vec<NetworkInterface>,
-    pub devices: Vec<NetworkDevice>,
-    pub gateway: Option<Gateway>,
-    pub dns_servers: Vec<IpAddr>,
-    pub wan_address: Option<WanAddress>,
-}
-
-impl NetworkSnapshot {
-    pub fn new(
-        interfaces: Vec<NetworkInterface>,
-        devices: Vec<NetworkDevice>,
-        gateway: Option<Gateway>,
-        dns_servers: Vec<IpAddr>,
-    ) -> Self {
-        Self {
-            interfaces,
-            devices,
-            gateway,
-            dns_servers,
-            wan_address: None,
-        }
-    }
-
-    /// Attaches the router's WAN address, per [[wan-ip-display]]. Builder
-    /// style, matching `DeviceObservation`'s existing `with_*` methods —
-    /// avoids a fifth positional `NetworkSnapshot::new` argument that every
-    /// existing call site (most of which never know a WAN address) would
-    /// otherwise have to thread through.
-    pub fn with_wan_address(mut self, wan_address: WanAddress) -> Self {
-        self.wan_address = Some(wan_address);
-        self
-    }
-}
-
-// For backward compatibility with existing code
-pub type NetworkData = NetworkSnapshot;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
-
-    #[test]
-    fn test_mac_address_creation() {
-        let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string());
-        assert!(mac.is_ok());
-        assert_eq!(format!("{}", mac.unwrap()), "AA:BB:CC:DD:EE:FF");
-    }
-
-    #[test]
-    fn test_mac_address_lowercase() {
-        let mac = MacAddress::new("aa:bb:cc:dd:ee:ff".to_string());
-        assert!(mac.is_ok());
-        assert_eq!(format!("{}", mac.unwrap()), "AA:BB:CC:DD:EE:FF");
-    }
-
-    #[test]
-    fn test_mac_address_with_dashes() {
-        let mac = MacAddress::new("AA-BB-CC-DD-EE-FF".to_string());
-        assert!(mac.is_ok());
-        assert_eq!(format!("{}", mac.unwrap()), "AA:BB:CC:DD:EE:FF");
-    }
-
-    #[test]
-    fn test_mac_address_invalid_length() {
-        let mac = MacAddress::new("AA:BB:CC".to_string());
-        assert!(mac.is_err());
-    }
-
-    #[test]
-    fn test_mac_address_invalid_hex() {
-        let mac = MacAddress::new("ZZ:BB:CC:DD:EE:FF".to_string());
-        assert!(mac.is_err());
-    }
+    use std::time::Duration;
 
     #[test]
     fn test_hostname_states() {
@@ -1079,60 +649,5 @@ mod tests {
         device.wireguard_activity = WireGuardActivity::Never(key);
 
         assert_eq!(device.activity_status(), ActivityStatus::Removed);
-    }
-
-    #[test]
-    fn test_gateway_creation() {
-        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
-        let gateway = Gateway::new(ip);
-        assert_eq!(format!("{}", gateway), "192.168.1.1");
-    }
-
-    #[test]
-    fn test_wan_address_creation() {
-        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
-        let wan = WanAddress::new(ip);
-        assert_eq!(format!("{}", wan), "203.0.113.7");
-    }
-
-    #[test]
-    fn test_network_snapshot_with_wan_address() {
-        let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
-        let snapshot = NetworkSnapshot::new(vec![], vec![], None, vec![])
-            .with_wan_address(WanAddress::new(ip));
-        assert_eq!(snapshot.wan_address, Some(WanAddress::new(ip)));
-    }
-
-    #[test]
-    fn test_is_private_address_rfc1918_ipv4() {
-        assert!(is_private_address(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
-        assert!(is_private_address(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
-        assert!(is_private_address(&IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
-    }
-
-    #[test]
-    fn test_is_private_address_public_ipv4_is_not_private() {
-        assert!(!is_private_address(&IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7))));
-        assert!(!is_private_address(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
-    }
-
-    #[test]
-    fn test_is_private_address_ula_ipv6() {
-        let ula: IpAddr = "fd12:3456:789a::1".parse().unwrap();
-        assert!(is_private_address(&ula));
-        let ula_fc: IpAddr = "fc00::1".parse().unwrap();
-        assert!(is_private_address(&ula_fc));
-    }
-
-    #[test]
-    fn test_is_private_address_link_local_ipv6_is_not_private() {
-        let link_local: IpAddr = "fe80::1".parse().unwrap();
-        assert!(!is_private_address(&link_local));
-    }
-
-    #[test]
-    fn test_is_private_address_public_ipv6_is_not_private() {
-        let public: IpAddr = "2001:db8::1".parse().unwrap();
-        assert!(!is_private_address(&public));
     }
 }
