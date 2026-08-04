@@ -114,12 +114,6 @@ impl MdnsDiscovery {
     }
 }
 
-impl Default for MdnsDiscovery {
-    fn default() -> Self {
-        Self::new().expect("Failed to create mDNS discovery daemon")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

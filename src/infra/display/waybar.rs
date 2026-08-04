@@ -6,11 +6,11 @@ use crate::domain::{
     NetworkDevice,
 };
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Waybar output format
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WaybarOutput {
     pub text: String,
     pub tooltip: String,
@@ -104,15 +104,13 @@ fn device_type_emoji(device_type: DeviceType) -> &'static str {
 }
 
 /// Format device identity with emoji and available information
-/// Format: {Emoji} {Manufacturer} {Model} or {Emoji} {FriendlyName} or just {Emoji}
+/// Format: {Emoji} {Manufacturer} or {Emoji} {FriendlyName} or just {Emoji}
 fn format_identity(identity: &DeviceIdentity) -> String {
     let emoji = device_type_emoji(identity.device_type);
 
-    match (&identity.manufacturer, &identity.model) {
-        (Some(mfr), Some(model)) => format!("{} {} {}", emoji, mfr.as_str(), model.as_str()),
-        (Some(mfr), None) => format!("{} {}", emoji, mfr.as_str()),
-        (None, Some(model)) => format!("{} {}", emoji, model.as_str()),
-        (None, None) => {
+    match &identity.manufacturer {
+        Some(mfr) => format!("{} {}", emoji, mfr.as_str()),
+        None => {
             if let Some(name) = &identity.friendly_name {
                 format!("{} {}", emoji, name.as_str())
             } else {

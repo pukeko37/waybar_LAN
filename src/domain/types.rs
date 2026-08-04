@@ -102,16 +102,6 @@ impl ManufacturerName {
     }
 }
 
-/// Device model name (e.g., "QN90B", "HL-2270DW")
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelName(String);
-
-impl ModelName {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 /// User-friendly device name
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FriendlyName(String);
@@ -347,8 +337,6 @@ pub struct DeviceIdentity {
     pub device_type: DeviceType,
     /// Manufacturer name (Samsung, Brother, etc.)
     pub manufacturer: Option<ManufacturerName>,
-    /// Model identifier (QN90B, HL-2270DW, etc.)
-    pub model: Option<ModelName>,
     /// User-friendly name or network hostname
     pub friendly_name: Option<FriendlyName>,
 }
@@ -358,7 +346,6 @@ impl DeviceIdentity {
         Self {
             device_type: DeviceType::Unknown,
             manufacturer: None,
-            model: None,
             friendly_name: None,
         }
     }
@@ -565,12 +552,11 @@ impl NetworkDevice {
     }
 
     /// Build DeviceIdentity from collected information
-    /// Uses priority-based inference for device type, manufacturer, model, and friendly name
+    /// Uses priority-based inference for device type, manufacturer, and friendly name
     pub fn build_identity(&mut self) {
         self.identity = DeviceIdentity {
             device_type: self.infer_device_type(),
             manufacturer: self.extract_manufacturer(),
-            model: self.extract_model(),
             friendly_name: self.extract_friendly_name(),
         };
     }
@@ -690,13 +676,6 @@ impl NetworkDevice {
             }
         }
 
-        None
-    }
-
-    /// Extract model from available sources
-    fn extract_model(&self) -> Option<ModelName> {
-        // Currently no sources for model name without UPnP
-        // Could be extended to parse from mDNS TXT records if available
         None
     }
 

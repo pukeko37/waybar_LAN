@@ -78,14 +78,11 @@ impl NetworkCollector {
                 .iter()
                 .map(|ip| {
                     let ip_val = *ip;
-                    s.spawn(move || (ip_val, proc_parsers::reverse_dns_lookup(&ip_val)))
+                    (ip_val, s.spawn(move || proc_parsers::reverse_dns_lookup(&ip_val)))
                 })
                 .collect::<Vec<_>>()
                 .into_iter()
-                .map(|handle| handle.join().unwrap_or_else(|_| {
-                    // Handle thread panic
-                    (device_ips[0], Hostname::Unknown)
-                }))
+                .map(|(ip_val, handle)| (ip_val, handle.join().unwrap_or(Hostname::Unknown)))
                 .collect()
         });
         let resolved_count = dns_lookups.values().filter(|h| matches!(h, Hostname::Resolved(_))).count();
