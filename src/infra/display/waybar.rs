@@ -45,16 +45,19 @@ fn colorize(status: ActivityStatus, text: &str) -> String {
     format!("{}{}{}", start, text, end)
 }
 
-/// This row's own tree glyph, per [[nested-tree-by-access-path]]'s nesting
-/// of the existing tree vocabulary one level deeper.
-fn tree_glyph(is_last: bool) -> &'static str {
-    if is_last { "└─ " } else { "├─ " }
-}
+/// Fixed indent for a device row under its group heading, per
+/// [[wifi-signal-new-device-and-flat-layout]] — supersedes the
+/// [[nested-tree-by-access-path]] tree-glyph nesting this replaced.
+/// Illustrative width (~3 em-dash-widths, Andrew's stated target); exact
+/// character count is a visual-tuning call against the tooltip's actual
+/// Pango-rendered font, not derived from character-width arithmetic.
+const INDENT: &str = "      ";
 
-/// The indent a row's children are drawn under — a continuing vertical bar
-/// when this row isn't the last in its list, plain space once it is.
-fn tree_continuation(is_last: bool) -> &'static str {
-    if is_last { "      " } else { "  │   " }
+/// A device row's sub-lines (`Services`, `Gateway`/`WAN`/`DNS`) indent one
+/// further `INDENT` step beyond their device row — not an independently
+/// tuned second value.
+fn sub_indent() -> String {
+    format!("{INDENT}{INDENT}")
 }
 
 /// Splits a Unix day count into (year, month, day), proleptic Gregorian
@@ -244,29 +247,19 @@ impl WaybarFormatter {
         groups
     }
 
-    /// Format every group as a heading line followed by its member devices,
-    /// nested one tree level deeper. Per [[nested-tree-by-access-path]].
+    /// Format every group as a flush-left heading line followed by its
+    /// member devices, indented one `INDENT` step. Per
+    /// [[wifi-signal-new-device-and-flat-layout]].
     fn format_groups(&self, groups: &[(String, Vec<&crate::domain::NetworkDevice>)],
         network_data: &NetworkData) -> Vec<String> {
-        let group_count = groups.len();
-        groups.iter().enumerate().flat_map(|(i, (heading, members))| {
-            let is_last_group = i == group_count - 1;
-            self.format_group(heading, members, is_last_group, network_data)
-        }).collect()
+        groups.iter().flat_map(|(heading, members)| self.format_group(heading, members, network_data)).collect()
     }
 
     /// Format one heading line and its nested member device rows.
     fn format_group(&self, heading: &str, members: &[&crate::domain::NetworkDevice],
-        is_last_group: bool, network_data: &NetworkData) -> Vec<String> {
-        let mut lines = vec![format!("  {}{}", tree_glyph(is_last_group), heading)];
-
-        let indent = format!("  {}", tree_continuation(is_last_group));
-        let member_count = members.len();
-        lines.extend(members.iter().enumerate().flat_map(|(i, device)| {
-            let is_last = i == member_count - 1;
-            self.format_device_entry(device, &indent, is_last, network_data)
-        }));
-
+        network_data: &NetworkData) -> Vec<String> {
+        let mut lines = vec![heading.to_string()];
+        lines.extend(members.iter().flat_map(|device| self.format_device_entry(device, network_data)));
         lines
     }
 
@@ -296,35 +289,33 @@ impl WaybarFormatter {
     }
 
     /// Format a single device entry with its services and gateway info,
-    /// nested under `indent` (the containing group's continuation prefix).
-    fn format_device_entry(&self, device: &crate::domain::NetworkDevice, indent: &str, is_last: bool,
+    /// indented one `INDENT` step under its group heading.
+    fn format_device_entry(&self, device: &crate::domain::NetworkDevice,
         network_data: &NetworkData) -> Vec<String> {
         let mut lines = Vec::new();
-        let prefix = format!("{}{}", indent, tree_glyph(is_last));
 
         // Main device line
         let display_name = format_identity(&device.identity);
         let colored_name = colorize(device.activity_status(), &display_name);
-        lines.push(format!("{}{} ({})", prefix, colored_name, device.primary_address()));
+        lines.push(format!("{INDENT}{colored_name} ({})", device.primary_address()));
 
         // Services
-        if let Some(services_line) = self.format_services(device, indent, is_last) {
+        if let Some(services_line) = self.format_services(device) {
             lines.push(services_line);
         }
 
         // Gateway/DNS info
-        lines.extend(self.format_gateway_info(device, indent, is_last, network_data));
+        lines.extend(self.format_gateway_info(device, network_data));
 
         lines
     }
 
     /// Format services list for a device
-    fn format_services(&self, device: &crate::domain::NetworkDevice, indent: &str, is_last: bool) -> Option<String> {
+    fn format_services(&self, device: &crate::domain::NetworkDevice) -> Option<String> {
         if device.services.is_empty() {
             return None;
         }
 
-        let service_prefix = format!("{}{}", indent, tree_continuation(is_last));
         let mut unique_services: Vec<String> = device.services
             .iter()
             .map(|s| s.friendly_type().to_string())
@@ -335,12 +326,12 @@ impl WaybarFormatter {
         if unique_services.is_empty() {
             None
         } else {
-            Some(format!("{}  Services: {}", service_prefix, unique_services.join(", ")))
+            Some(format!("{}Services: {}", sub_indent(), unique_services.join(", ")))
         }
     }
 
     /// Format gateway and DNS information for a device
-    fn format_gateway_info(&self, device: &crate::domain::NetworkDevice, indent: &str, is_last: bool,
+    fn format_gateway_info(&self, device: &crate::domain::NetworkDevice,
         network_data: &NetworkData) -> Vec<String> {
         use std::net::IpAddr;
 
@@ -350,19 +341,19 @@ impl WaybarFormatter {
         }
 
         let mut lines = Vec::new();
-        let info_prefix = format!("{}{}", indent, tree_continuation(is_last));
+        let info_prefix = sub_indent();
 
         // Gateway label
         let dns_matches_gateway = network_data.dns_servers.iter().any(|dns| dns == &gateway.0);
         if dns_matches_gateway {
-            lines.push(format!("{}  Gateway (also DNS)", info_prefix));
+            lines.push(format!("{}Gateway (also DNS)", info_prefix));
         } else {
-            lines.push(format!("{}  Gateway", info_prefix));
+            lines.push(format!("{}Gateway", info_prefix));
         }
 
         // WAN address, per [[wan-ip-display]]
         if let Some(wan_address) = network_data.wan_address {
-            lines.push(format!("{}  WAN: {}", info_prefix, wan_address));
+            lines.push(format!("{}WAN: {}", info_prefix, wan_address));
         }
 
         // Additional DNS servers
@@ -376,7 +367,7 @@ impl WaybarFormatter {
                 .iter()
                 .map(|dns| self.format_dns_entry(dns))
                 .collect();
-            lines.push(format!("{}  DNS: {}", info_prefix, dns_list.join(", ")));
+            lines.push(format!("{}DNS: {}", info_prefix, dns_list.join(", ")));
         }
 
         lines
@@ -615,12 +606,17 @@ mod tests {
         let output = formatter.format(&data).unwrap();
 
         // One device, one device row nested under one group heading — not
-        // two rows for the two addresses. Per [[nested-tree-by-access-path]]
-        // the tooltip is now a two-level tree, so this is one heading glyph
-        // (its single access-path group) plus one device-row glyph.
+        // two rows for the two addresses. Per
+        // [[wifi-signal-new-device-and-flat-layout]] a device row is any
+        // line starting with exactly one INDENT step (not two, which would
+        // be a Services/Gateway sub-line).
         assert_eq!(output.text, "🖧 1 device");
-        let row_count = output.tooltip.matches("└─").count() + output.tooltip.matches("├─").count();
-        assert_eq!(row_count, 2);
+        let device_row_count = output
+            .tooltip
+            .lines()
+            .filter(|l| l.starts_with(INDENT) && !l.starts_with(&format!("{INDENT}{INDENT}")))
+            .count();
+        assert_eq!(device_row_count, 1);
     }
 
     #[test]
@@ -777,12 +773,50 @@ mod tests {
         let data = NetworkData::new(vec![interface], vec![device], None, vec![]);
         let output = formatter.format(&data).unwrap();
 
-        // Heading at the outer level, device row indented one level deeper.
-        assert!(output.tooltip.contains("  └─ via eno1"));
-        assert!(output.tooltip.contains("      └─ "));
+        // Heading flush left, device row indented one INDENT step deeper.
+        assert!(output.tooltip.lines().any(|l| l == "via eno1"));
+        assert!(output.tooltip.lines().any(|l| l.starts_with(INDENT) && !l.starts_with("via")));
         // The inline "via eno1" annotation is gone from the device row itself
         // (only the heading states it) — the device row's own parenthesised
         // location is just the address.
         assert!(output.tooltip.contains(&format!("({})", ip)));
+    }
+
+    #[test]
+    fn test_services_sub_line_indents_one_step_deeper_than_device_row() {
+        let formatter = WaybarFormatter::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
+        let interface = NetworkInterface::new(crate::domain::InterfaceName::new("eno1".to_string()), ip, Some(mac.clone()));
+        let mut device = local_device(ip, mac, "eno1");
+        device.services.push(crate::domain::ServiceInfo::new(
+            crate::domain::ServiceType::new("_ssh._tcp.local.".to_string()),
+            crate::domain::ServiceInstanceName::new("my-nas".to_string()),
+            22,
+        ));
+
+        let data = NetworkData::new(vec![interface], vec![device], None, vec![]);
+        let output = formatter.format(&data).unwrap();
+
+        let services_line = output.tooltip.lines().find(|l| l.contains("Services:")).unwrap();
+        assert!(services_line.starts_with(&format!("{INDENT}{INDENT}")));
+        // Not a third INDENT step — exactly one deeper than the device row.
+        assert!(!services_line.starts_with(&format!("{INDENT}{INDENT}{INDENT}")));
+    }
+
+    #[test]
+    fn test_no_tree_glyphs_remain_in_tooltip() {
+        let formatter = WaybarFormatter::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
+        let interface = NetworkInterface::new(crate::domain::InterfaceName::new("eno1".to_string()), ip, Some(mac.clone()));
+        let device = local_device(ip, mac, "eno1");
+
+        let data = NetworkData::new(vec![interface], vec![device], None, vec![]);
+        let output = formatter.format(&data).unwrap();
+
+        assert!(!output.tooltip.contains('├'));
+        assert!(!output.tooltip.contains('└'));
+        assert!(!output.tooltip.contains('│'));
     }
 }
