@@ -406,5 +406,5 @@ fn test_merge_wireguard_device_never_gets_first_observed() {
     assert_eq!(merged.devices.len(), 1);
     assert_eq!(merged.devices[0].first_observed, None);
     assert!(!merged.devices[0].is_newly_observed());
-    assert!(new_history.get(&merged.devices[0].id).is_none());
+    assert!(!new_history.contains_key(&merged.devices[0].id));
 }
