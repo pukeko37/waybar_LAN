@@ -324,3 +324,87 @@ fn test_merge_wifi_signal_none_when_no_clients_match() {
     assert!(!merged.devices[0].on_wifi);
     assert_eq!(merged.devices[0].wifi_signal, None);
 }
+
+#[test]
+fn test_merge_sets_first_observed_to_now_on_first_ever_appearance() {
+    let ip: IpAddr = "192.168.1.79".parse().unwrap();
+    let mac = MacAddress::new("22:33:44:55:66:77".to_string()).unwrap();
+    let local = NetworkSnapshot::new(vec![], vec![], None, vec![]);
+
+    let router = RouterSnapshot {
+        observations: vec![TieredObservation {
+            tier: RouterSourceTier::NeighborTable,
+            observation: DeviceObservation::new(ip).with_mac(mac),
+        }],
+        wifi_clients: vec![],
+        wan_address: None,
+    };
+
+    let before = std::time::SystemTime::now();
+    let (merged, new_history) = merge_network_and_router(local, router, &HashMap::new());
+
+    assert_eq!(merged.devices.len(), 1);
+    let device = &merged.devices[0];
+    assert!(device.is_newly_observed());
+    let first_observed = device.first_observed.expect("non-WireGuard device with a vote should have first_observed set");
+    assert!(first_observed >= before);
+    assert_eq!(new_history.get(&device.id).unwrap().first_observed, first_observed);
+}
+
+#[test]
+fn test_merge_carries_forward_first_observed_across_polls() {
+    // Regression test for the migration/no-re-flagging rule: a device
+    // already known from a previous poll must not look newly observed
+    // again just because this poll also voted for it.
+    let ip: IpAddr = "192.168.1.80".parse().unwrap();
+    let mac = MacAddress::new("33:44:55:66:77:88".to_string()).unwrap();
+    let id = DeviceId::Mac(mac.clone());
+    let local = NetworkSnapshot::new(vec![], vec![], None, vec![]);
+
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(10 * 24 * 60 * 60);
+    let mut history = HashMap::new();
+    history.insert(id, crate::domain::DeviceHistory { first_observed: long_ago, last_observed: long_ago });
+
+    let router = RouterSnapshot {
+        observations: vec![TieredObservation {
+            tier: RouterSourceTier::NeighborTable,
+            observation: DeviceObservation::new(ip).with_mac(mac),
+        }],
+        wifi_clients: vec![],
+        wan_address: None,
+    };
+
+    let (merged, new_history) = merge_network_and_router(local, router, &history);
+
+    assert_eq!(merged.devices.len(), 1);
+    let device = &merged.devices[0];
+    assert_eq!(device.first_observed, Some(long_ago));
+    assert!(!device.is_newly_observed());
+    // last_observed still refreshes to now (this poll did vote for it) —
+    // only first_observed stays pinned.
+    assert!(new_history.get(&device.id).unwrap().last_observed > long_ago);
+    assert_eq!(new_history.get(&device.id).unwrap().first_observed, long_ago);
+}
+
+#[test]
+fn test_merge_wireguard_device_never_gets_first_observed() {
+    let ip: IpAddr = "10.20.30.9".parse().unwrap();
+    let local = NetworkSnapshot::new(vec![], vec![], None, vec![]);
+
+    let router = RouterSnapshot {
+        observations: vec![TieredObservation {
+            tier: RouterSourceTier::WireGuard,
+            observation: DeviceObservation::new(ip)
+                .with_wireguard_activity(WireGuardPublicKey::new("pubkey123".to_string()), Some(std::time::SystemTime::now())),
+        }],
+        wifi_clients: vec![],
+        wan_address: None,
+    };
+
+    let (merged, new_history) = merge_network_and_router(local, router, &HashMap::new());
+
+    assert_eq!(merged.devices.len(), 1);
+    assert_eq!(merged.devices[0].first_observed, None);
+    assert!(!merged.devices[0].is_newly_observed());
+    assert!(new_history.get(&merged.devices[0].id).is_none());
+}

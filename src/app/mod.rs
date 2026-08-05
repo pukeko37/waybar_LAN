@@ -4,7 +4,7 @@
 //! infrastructure adapters implement. No `use crate::infra::` imports here
 //! outside `#[cfg(test)]`.
 
-use crate::domain::{DeviceAddress, DeviceId, DeviceObservation, Hostname, MacAddress, NeighborState, NetworkDevice, NetworkSnapshot, SignalStrength, WanAddress, WireGuardActivity, WireGuardPublicKey};
+use crate::domain::{DeviceAddress, DeviceHistory, DeviceId, DeviceObservation, Hostname, MacAddress, NeighborState, NetworkDevice, NetworkSnapshot, SignalStrength, WanAddress, WireGuardActivity, WireGuardPublicKey};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::SystemTime;
@@ -162,8 +162,8 @@ impl UnionFind {
 pub fn merge_network_and_router(
     local: NetworkSnapshot,
     router: RouterSnapshot,
-    history: &HashMap<DeviceId, SystemTime>,
-) -> (NetworkSnapshot, HashMap<DeviceId, SystemTime>) {
+    history: &HashMap<DeviceId, DeviceHistory>,
+) -> (NetworkSnapshot, HashMap<DeviceId, DeviceHistory>) {
     let mut by_ip: HashMap<IpAddr, Vec<(u8, DeviceObservation)>> = HashMap::new();
     let mut local_bases: HashMap<IpAddr, NetworkDevice> = HashMap::new();
 
@@ -207,8 +207,8 @@ pub fn merge_network_and_router(
         .into_iter()
         .filter_map(|cluster_ips| build_device(cluster_ips, &ctx))
         .map(|(device, history_update)| {
-            if let Some((id, seen_at)) = history_update {
-                new_history.insert(id, seen_at);
+            if let Some((id, device_history)) = history_update {
+                new_history.insert(id, device_history);
             }
             device
         })
@@ -277,10 +277,12 @@ struct BuildContext<'a> {
     /// `router.wifi_clients` — MAC-keyed side lookup, not a fold
     /// participant (see `RouterSnapshot`'s doc comment).
     wifi_clients: &'a [WifiClient],
-    /// Persisted per-device last-observed timestamps from the previous
-    /// poll, per [[device-recency-and-removal]]. Never consulted for
-    /// WireGuard-identified devices — their clock is `wireguard_activity`.
-    history: &'a HashMap<DeviceId, SystemTime>,
+    /// Persisted per-device recency record from the previous poll, per
+    /// [[device-recency-and-removal]] (`last_observed`) and
+    /// [[wifi-signal-new-device-and-flat-layout]] (`first_observed`).
+    /// Never consulted for WireGuard-identified devices — their clock is
+    /// `wireguard_activity`.
+    history: &'a HashMap<DeviceId, DeviceHistory>,
     /// Captured once per merge, not re-read per device, so every device
     /// built from the same poll shares an identical "now".
     now: SystemTime,
@@ -293,11 +295,12 @@ struct BuildContext<'a> {
 /// incomplete/failed ARP entries, not real devices).
 ///
 /// Alongside the device, returns the persisted-history update this device
-/// should cause (`Some((id, now))` if this poll counted as a fresh
-/// observation of a non-WireGuard device, `None` otherwise) — the caller
-/// folds these into the returned history map. See
-/// [[device-recency-and-removal]].
-fn build_device(cluster_ips: Vec<IpAddr>, ctx: &BuildContext) -> Option<(NetworkDevice, Option<(DeviceId, SystemTime)>)> {
+/// should cause (`Some((id, DeviceHistory))` if this poll counted as a
+/// fresh observation of a non-WireGuard device, `None` otherwise) — the
+/// caller folds these into the returned history map. See
+/// [[device-recency-and-removal]] and
+/// [[wifi-signal-new-device-and-flat-layout]].
+fn build_device(cluster_ips: Vec<IpAddr>, ctx: &BuildContext) -> Option<(NetworkDevice, Option<(DeviceId, DeviceHistory)>)> {
     let mut flattened: Vec<&(u8, DeviceObservation)> =
         cluster_ips.iter().flat_map(|ip| ctx.by_ip[ip].iter()).collect();
     flattened.sort_by_key(|(rank, _)| *rank);
@@ -380,12 +383,22 @@ fn build_device(cluster_ips: Vec<IpAddr>, ctx: &BuildContext) -> Option<(Network
     // a durable `leases`/`clients` binding, never corroborated by any
     // activity signal, correctly reads Removed rather than Active) — see
     // [[device-recency-and-removal]].
+    //
+    // first_observed (per [[wifi-signal-new-device-and-flat-layout]]) is
+    // independent of the vote: it's set once, the moment a DeviceId first
+    // gets a history entry at all, and carried forward unchanged on every
+    // later poll regardless of whether that poll itself voted — a device
+    // that's gone quiet for a while and then reappears is not "new" again.
+    let prior = ctx.history.get(&device.id);
     let history_update = if device.wireguard_activity == WireGuardActivity::NotApplicable {
         if neigh_vote || device.on_wifi {
             device.last_seen = ctx.now;
-            Some((device.id.clone(), ctx.now))
+            let first_observed = prior.map(|h| h.first_observed).unwrap_or(ctx.now);
+            device.first_observed = Some(first_observed);
+            Some((device.id.clone(), DeviceHistory { first_observed, last_observed: ctx.now }))
         } else {
-            device.last_seen = ctx.history.get(&device.id).copied().unwrap_or(std::time::UNIX_EPOCH);
+            device.last_seen = prior.map(|h| h.last_observed).unwrap_or(std::time::UNIX_EPOCH);
+            device.first_observed = prior.map(|h| h.first_observed);
             None
         }
     } else {

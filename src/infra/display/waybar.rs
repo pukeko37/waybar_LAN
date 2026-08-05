@@ -316,7 +316,8 @@ impl WaybarFormatter {
         let display_name = format_identity(&device.identity);
         let colored_name = colorize(device.activity_status(), &display_name);
         let signal = signal_icon(device.wifi_signal);
-        lines.push(format!("{INDENT}{signal}{colored_name} ({})", device.primary_address()));
+        let new_marker = if device.is_newly_observed() { " <span color='#00FF00'>★</span>" } else { "" };
+        lines.push(format!("{INDENT}{signal}{colored_name} ({}){new_marker}", device.primary_address()));
 
         // Services
         if let Some(services_line) = self.format_services(device) {
@@ -883,5 +884,53 @@ mod tests {
         let wired_row = output.tooltip.lines().find(|l| l.contains(&format!("({wired_ip})"))).unwrap();
         assert!(wifi_row.starts_with(&format!("{INDENT}█")));
         assert!(wired_row.starts_with(&format!("{INDENT} ")));
+    }
+
+    #[test]
+    fn test_newly_observed_device_gets_green_star_appended_at_line_end() {
+        let formatter = WaybarFormatter::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
+        let interface = NetworkInterface::new(crate::domain::InterfaceName::new("eno1".to_string()), ip, Some(mac.clone()));
+        let mut device = local_device(ip, mac, "eno1");
+        device.first_observed = Some(std::time::SystemTime::now() - std::time::Duration::from_secs(3600));
+
+        let data = NetworkData::new(vec![interface], vec![device], None, vec![]);
+        let output = formatter.format(&data).unwrap();
+
+        let device_row = output.tooltip.lines().find(|l| l.contains(&format!("({ip})"))).unwrap();
+        assert!(device_row.ends_with("★</span>"));
+        assert!(device_row.contains("#00FF00"));
+    }
+
+    #[test]
+    fn test_device_over_24h_old_gets_no_star() {
+        let formatter = WaybarFormatter::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
+        let interface = NetworkInterface::new(crate::domain::InterfaceName::new("eno1".to_string()), ip, Some(mac.clone()));
+        let mut device = local_device(ip, mac, "eno1");
+        device.first_observed = Some(std::time::SystemTime::now() - std::time::Duration::from_secs(86401));
+
+        let data = NetworkData::new(vec![interface], vec![device], None, vec![]);
+        let output = formatter.format(&data).unwrap();
+
+        let device_row = output.tooltip.lines().find(|l| l.contains(&format!("({ip})"))).unwrap();
+        assert!(!device_row.contains('★'));
+    }
+
+    #[test]
+    fn test_device_with_no_first_observed_gets_no_star() {
+        let formatter = WaybarFormatter::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
+        let interface = NetworkInterface::new(crate::domain::InterfaceName::new("eno1".to_string()), ip, Some(mac.clone()));
+        let device = local_device(ip, mac, "eno1"); // first_observed left at its None default
+
+        let data = NetworkData::new(vec![interface], vec![device], None, vec![]);
+        let output = formatter.format(&data).unwrap();
+
+        let device_row = output.tooltip.lines().find(|l| l.contains(&format!("({ip})"))).unwrap();
+        assert!(!device_row.contains('★'));
     }
 }

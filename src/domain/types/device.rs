@@ -407,6 +407,22 @@ pub struct NetworkDevice {
     /// Set alongside `on_wifi` by the same `clients` MAC match — `None` for
     /// every non-Wi-Fi device. See [[wifi-signal-new-device-and-flat-layout]].
     pub wifi_signal: Option<SignalStrength>,
+    /// When this `DeviceId` was first ever recorded in the persisted
+    /// history file — set once, never updated again afterwards. `None` for
+    /// WireGuard-identified devices (their clock is `wireguard_activity`,
+    /// and they never touch the history file at all — same carve-out
+    /// `last_seen` already has) and for any device with no history entry
+    /// yet. See [[wifi-signal-new-device-and-flat-layout]].
+    pub first_observed: Option<SystemTime>,
+}
+
+/// One device's persisted recency record from the history file — both
+/// clocks together, not two parallel maps, per
+/// [[wifi-signal-new-device-and-flat-layout]].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceHistory {
+    pub first_observed: SystemTime,
+    pub last_observed: SystemTime,
 }
 
 impl NetworkDevice {
@@ -423,7 +439,20 @@ impl NetworkDevice {
             wireguard_activity: WireGuardActivity::NotApplicable,
             on_wifi: false,
             wifi_signal: None,
+            first_observed: None,
         }
+    }
+
+    /// Whether this device counts as newly observed — `first_observed`
+    /// within the last 24h, reusing `ActivityStatus`'s existing `Removed`
+    /// ceiling horizon rather than a fresh threshold. `false` for WireGuard
+    /// devices (`first_observed` is always `None` for them) and for any
+    /// device with no `first_observed` at all. See
+    /// [[wifi-signal-new-device-and-flat-layout]].
+    pub fn is_newly_observed(&self) -> bool {
+        self.first_observed.is_some_and(|t| {
+            SystemTime::now().duration_since(t).unwrap_or(Duration::from_secs(0)) < Duration::from_secs(86400)
+        })
     }
 
     /// This device's primary/display address: the lowest-numbered IPv4
@@ -601,6 +630,35 @@ mod tests {
         let device = NetworkDevice::new(DeviceId::Ip(lower_ip), addresses, None);
 
         assert_eq!(device.primary_address(), lower_ip);
+    }
+
+    #[test]
+    fn test_is_newly_observed_true_within_24h() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let address = DeviceAddress { ip, interface_name: None, neighbor_state: NeighborState::Unknown };
+        let mut device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
+        device.first_observed = Some(SystemTime::now() - Duration::from_secs(3600));
+
+        assert!(device.is_newly_observed());
+    }
+
+    #[test]
+    fn test_is_newly_observed_false_over_24h() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let address = DeviceAddress { ip, interface_name: None, neighbor_state: NeighborState::Unknown };
+        let mut device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
+        device.first_observed = Some(SystemTime::now() - Duration::from_secs(86401));
+
+        assert!(!device.is_newly_observed());
+    }
+
+    #[test]
+    fn test_is_newly_observed_false_when_none() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let address = DeviceAddress { ip, interface_name: None, neighbor_state: NeighborState::Unknown };
+        let device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
+
+        assert!(!device.is_newly_observed());
     }
 
     #[test]
