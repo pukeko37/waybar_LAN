@@ -118,6 +118,15 @@ impl NeighborState {
             _ => Self::Unknown,
         }
     }
+
+    /// True for states the kernel currently reports as live or being
+    /// actively verified. Used to prefer a device's currently-reachable
+    /// address over a stale leftover one (e.g. an old DHCP lease's address
+    /// still lingering in a router's ARP cache) when it has more than
+    /// one — see `NetworkDevice::primary_address`.
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Reachable | Self::Delay | Self::Probe)
+    }
 }
 
 /// Device activity status based on last seen time
@@ -293,11 +302,18 @@ impl WireGuardActivity {
 
 /// One address a device is reachable at, plus which of *this host's own*
 /// interfaces it was seen on locally (`None` for a router-only address —
-/// there is no local NIC to attribute it to).
+/// there is no local NIC to attribute it to), and that specific address's
+/// own neighbor-table reachability (`Unknown` when no source reported one —
+/// e.g. an address known only via `leases`/`wg-peers`). Tracked per-address,
+/// not just once per device, so a device with several addresses (the same
+/// physical device seen at more than one address — see
+/// [[device-catalogue-identity]]) can tell a currently-live address apart
+/// from a stale leftover one; see `NetworkDevice::primary_address`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceAddress {
     pub ip: IpAddr,
     pub interface_name: Option<InterfaceName>,
+    pub neighbor_state: NeighborState,
 }
 
 /// A partial per-address record contributed by one data source (local
@@ -406,18 +422,29 @@ impl NetworkDevice {
         }
     }
 
-    /// This device's primary/display address: first IPv4 address, else the
-    /// first address of any kind.
+    /// This device's primary/display address: the lowest-numbered IPv4
+    /// address that's currently `is_active()` (Reachable/Delay/Probe),
+    /// falling back to the lowest-numbered IPv4 address overall if none
+    /// are, falling back to the first address at all if there's no IPv4.
+    /// Computed independent of `addresses`' own order (`min_by_key`, not a
+    /// positional `.first()`), so this doesn't depend on callers already
+    /// having sorted it. Preferring an active address over a merely
+    /// lower-numbered one matters once a device can have several — e.g. a
+    /// stale ARP-cache entry at an old DHCP-leased address, still merged
+    /// onto the same device (see [[device-catalogue-identity]]) as the
+    /// address it actually holds now.
     ///
     /// Safety: `addresses` is never empty — every `NetworkDevice` is built
     /// from at least one clustered address (see `app::merge_network_and_router`)
     /// or one DTO-derived address (see `infra::network::models`).
     pub fn primary_address(&self) -> IpAddr {
-        self.addresses
-            .iter()
-            .find(|a| a.ip.is_ipv4())
-            .or_else(|| self.addresses.first())
+        let ipv4 = self.addresses.iter().filter(|a| a.ip.is_ipv4());
+        ipv4.clone()
+            .filter(|a| a.neighbor_state.is_active())
+            .min_by_key(|a| a.ip)
+            .or_else(|| ipv4.min_by_key(|a| a.ip))
             .map(|a| a.ip)
+            .or_else(|| self.addresses.first().map(|a| a.ip))
             .expect("NetworkDevice always has at least one address")
     }
 
@@ -498,7 +525,7 @@ mod tests {
     fn test_network_device_creation() {
         let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
         let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
-        let address = DeviceAddress { ip, interface_name: Some(InterfaceName::new("eth0".to_string())) };
+        let address = DeviceAddress { ip, interface_name: Some(InterfaceName::new("eth0".to_string())), neighbor_state: NeighborState::Unknown };
         let device = NetworkDevice::new(DeviceId::Mac(mac.clone()), vec![address], Some(mac));
 
         assert_eq!(device.primary_address(), ip);
@@ -509,7 +536,7 @@ mod tests {
     #[test]
     fn test_network_device_mac_is_optional() {
         let ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
-        let address = DeviceAddress { ip, interface_name: Some(InterfaceName::new("wg0".to_string())) };
+        let address = DeviceAddress { ip, interface_name: Some(InterfaceName::new("wg0".to_string())), neighbor_state: NeighborState::Unknown };
         let device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
 
         assert_eq!(device.mac, None);
@@ -519,7 +546,7 @@ mod tests {
     #[test]
     fn test_network_device_interface_name_is_optional_for_router_only_devices() {
         let ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 5));
-        let address = DeviceAddress { ip, interface_name: None };
+        let address = DeviceAddress { ip, interface_name: None, neighbor_state: NeighborState::Unknown };
         let device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
 
         assert_eq!(device.addresses[0].interface_name, None);
@@ -530,12 +557,46 @@ mod tests {
         let ipv4 = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
         let ipv6: IpAddr = "fe80::1".parse().unwrap();
         let addresses = vec![
-            DeviceAddress { ip: ipv6, interface_name: None },
-            DeviceAddress { ip: ipv4, interface_name: None },
+            DeviceAddress { ip: ipv6, interface_name: None, neighbor_state: NeighborState::Unknown },
+            DeviceAddress { ip: ipv4, interface_name: None, neighbor_state: NeighborState::Unknown },
         ];
         let device = NetworkDevice::new(DeviceId::Ip(ipv4), addresses, None);
 
         assert_eq!(device.primary_address(), ipv4);
+    }
+
+    #[test]
+    fn test_network_device_primary_address_prefers_active_over_lower_numbered_stale() {
+        // Regression test: a device correlated across two addresses sharing
+        // one MAC — e.g. a stale ARP-cache entry at an old DHCP-leased
+        // address, still merged onto the same device as the address it
+        // holds now — must show the currently-reachable address, not
+        // whichever happens to sort lower numerically.
+        let stale_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 156));
+        let active_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 157));
+        let addresses = vec![
+            DeviceAddress { ip: stale_ip, interface_name: None, neighbor_state: NeighborState::Stale },
+            DeviceAddress { ip: active_ip, interface_name: None, neighbor_state: NeighborState::Reachable },
+        ];
+        let device = NetworkDevice::new(DeviceId::Ip(active_ip), addresses, None);
+
+        assert_eq!(device.primary_address(), active_ip);
+    }
+
+    #[test]
+    fn test_network_device_primary_address_falls_back_to_lowest_when_none_active() {
+        // No address is currently confirmed live (e.g. two Stale entries,
+        // or a durable leases/wg-peers-only address with no neigh vote at
+        // all): falls back to today's existing tie-break, lowest IPv4.
+        let lower_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let higher_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 51));
+        let addresses = vec![
+            DeviceAddress { ip: higher_ip, interface_name: None, neighbor_state: NeighborState::Stale },
+            DeviceAddress { ip: lower_ip, interface_name: None, neighbor_state: NeighborState::Unknown },
+        ];
+        let device = NetworkDevice::new(DeviceId::Ip(lower_ip), addresses, None);
+
+        assert_eq!(device.primary_address(), lower_ip);
     }
 
     #[test]
@@ -624,7 +685,7 @@ mod tests {
         // effectively always "now" (reset on every poll's device rebuild), so
         // without this override every peer always read as Active.
         let ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
-        let address = DeviceAddress { ip, interface_name: None };
+        let address = DeviceAddress { ip, interface_name: None, neighbor_state: NeighborState::Unknown };
         let mut device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
         let key = WireGuardPublicKey::new("gN4DvXs=".to_string());
         device.wireguard_activity =
@@ -636,7 +697,7 @@ mod tests {
     #[test]
     fn test_network_device_activity_status_wireguard_handshake_within_hour_is_active() {
         let ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
-        let address = DeviceAddress { ip, interface_name: None };
+        let address = DeviceAddress { ip, interface_name: None, neighbor_state: NeighborState::Unknown };
         let mut device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
         let key = WireGuardPublicKey::new("gN4DvXs=".to_string());
         device.wireguard_activity =
@@ -655,7 +716,7 @@ mod tests {
         // [[device-recency-and-removal]]'s "Removed, elapsed >= 24h" ceiling,
         // which the decision states applies uniformly, not only to Unknown.
         let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99));
-        let address = DeviceAddress { ip, interface_name: None };
+        let address = DeviceAddress { ip, interface_name: None, neighbor_state: NeighborState::Unknown };
         let mut device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
         device.neighbor_state = NeighborState::Stale;
         device.last_seen = SystemTime::now() - Duration::from_secs(86401);
@@ -666,7 +727,7 @@ mod tests {
     #[test]
     fn test_network_device_activity_status_failed_neighbor_over_a_day_since_last_seen_is_removed() {
         let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99));
-        let address = DeviceAddress { ip, interface_name: None };
+        let address = DeviceAddress { ip, interface_name: None, neighbor_state: NeighborState::Unknown };
         let mut device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
         device.neighbor_state = NeighborState::Failed;
         device.last_seen = SystemTime::now() - Duration::from_secs(86401);
@@ -677,7 +738,7 @@ mod tests {
     #[test]
     fn test_network_device_activity_status_stale_neighbor_under_a_day_since_last_seen_is_stale() {
         let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99));
-        let address = DeviceAddress { ip, interface_name: None };
+        let address = DeviceAddress { ip, interface_name: None, neighbor_state: NeighborState::Unknown };
         let mut device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
         device.neighbor_state = NeighborState::Stale;
         device.last_seen = SystemTime::now() - Duration::from_secs(3600);
@@ -693,7 +754,7 @@ mod tests {
         // WireGuard peer) and read as Active. It must now read Removed
         // unconditionally, without consulting neighbor_state or last_seen.
         let ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
-        let address = DeviceAddress { ip, interface_name: None };
+        let address = DeviceAddress { ip, interface_name: None, neighbor_state: NeighborState::Unknown };
         let mut device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
         let key = WireGuardPublicKey::new("gN4DvXs=".to_string());
         device.wireguard_activity = WireGuardActivity::Never(key);

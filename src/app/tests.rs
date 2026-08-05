@@ -39,7 +39,8 @@ use crate::domain::{FriendlyName, InterfaceName, NeighborState};
 
 fn local_device(ip: IpAddr, mac: &str, hostname: &str, interface: &str) -> NetworkDevice {
     let mac = MacAddress::new(mac.to_string()).unwrap();
-    let address = DeviceAddress { ip, interface_name: Some(InterfaceName::new(interface.to_string())) };
+    let address =
+        DeviceAddress { ip, interface_name: Some(InterfaceName::new(interface.to_string())), neighbor_state: NeighborState::Unknown };
     let mut device = NetworkDevice::new(DeviceId::Mac(mac.clone()), vec![address], Some(mac));
     device.hostname = Hostname::resolved(hostname.to_string());
     device.services.push(crate::domain::ServiceInfo::new(
@@ -196,6 +197,46 @@ fn test_merge_correlates_dual_homed_device_across_two_addresses_by_mac() {
     assert_eq!(device.addresses.len(), 2);
     assert!(device.addresses.iter().any(|a| a.ip == lan_ip));
     assert!(device.addresses.iter().any(|a| a.ip == link_local_ip));
+}
+
+#[test]
+fn test_merge_prefers_reachable_address_over_stale_leftover_sharing_a_mac() {
+    // Regression test for a live bug: a router's ARP cache can carry a
+    // leftover Stale entry for a device's *previous* DHCP-leased address
+    // alongside the Reachable entry for its current one — same MAC, same
+    // device, two addresses. Correlation correctly merges them into one
+    // device (as above), but the device must display/sort by the
+    // currently-reachable address, not whichever IP happens to be
+    // numerically lower.
+    let stale_ip: IpAddr = "192.168.1.156".parse().unwrap();
+    let reachable_ip: IpAddr = "192.168.1.157".parse().unwrap();
+    let mac = MacAddress::new("18:C0:4D:A7:B8:B6".to_string()).unwrap();
+    let local = NetworkSnapshot::new(vec![], vec![], None, vec![]);
+
+    let router = RouterSnapshot {
+        observations: vec![
+            TieredObservation {
+                tier: RouterSourceTier::NeighborTable,
+                observation: DeviceObservation::new(stale_ip)
+                    .with_mac(mac.clone())
+                    .with_neighbor_state(NeighborState::Stale),
+            },
+            TieredObservation {
+                tier: RouterSourceTier::NeighborTable,
+                observation: DeviceObservation::new(reachable_ip)
+                    .with_mac(mac)
+                    .with_neighbor_state(NeighborState::Reachable),
+            },
+        ],
+        wifi_clients: vec![],
+        wan_address: None,
+    };
+
+    let (merged, _history) = merge_network_and_router(local, router, &HashMap::new());
+    assert_eq!(merged.devices.len(), 1);
+    let device = &merged.devices[0];
+    assert_eq!(device.addresses.len(), 2);
+    assert_eq!(device.primary_address(), reachable_ip);
 }
 
 #[test]

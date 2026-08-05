@@ -490,6 +490,7 @@ mod tests {
         let address = crate::domain::DeviceAddress {
             ip,
             interface_name: Some(crate::domain::InterfaceName::new(interface.to_string())),
+            neighbor_state: crate::domain::NeighborState::Unknown,
         };
         NetworkDevice::new(crate::domain::DeviceId::Mac(mac.clone()), vec![address], Some(mac))
     }
@@ -547,7 +548,7 @@ mod tests {
         // identified only by its WireGuard public key.
         let peer_ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
         let key = crate::domain::WireGuardPublicKey::new("pubkey123".to_string());
-        let peer_address = crate::domain::DeviceAddress { ip: peer_ip, interface_name: None };
+        let peer_address = crate::domain::DeviceAddress { ip: peer_ip, interface_name: None, neighbor_state: crate::domain::NeighborState::Unknown };
         let peer = NetworkDevice::new(crate::domain::DeviceId::WireGuardKey(key), vec![peer_address], None);
 
         let data = NetworkData::new(vec![interface], vec![local, peer], None, vec![]);
@@ -566,7 +567,7 @@ mod tests {
         let formatter = WaybarFormatter::new();
         let peer_ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
         let key = crate::domain::WireGuardPublicKey::new("pubkey123".to_string());
-        let peer_address = crate::domain::DeviceAddress { ip: peer_ip, interface_name: None };
+        let peer_address = crate::domain::DeviceAddress { ip: peer_ip, interface_name: None, neighbor_state: crate::domain::NeighborState::Unknown };
         let mut peer = NetworkDevice::new(crate::domain::DeviceId::WireGuardKey(key.clone()), vec![peer_address], None);
         peer.wireguard_activity = crate::domain::WireGuardActivity::Never(key);
 
@@ -586,7 +587,7 @@ mod tests {
 
         let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 77));
         let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
-        let address = crate::domain::DeviceAddress { ip, interface_name: None };
+        let address = crate::domain::DeviceAddress { ip, interface_name: None, neighbor_state: crate::domain::NeighborState::Unknown };
         let mut device = NetworkDevice::new(crate::domain::DeviceId::Mac(mac.clone()), vec![address], Some(mac));
         device.on_wifi = true;
 
@@ -605,8 +606,8 @@ mod tests {
 
         let interface = NetworkInterface::new(crate::domain::InterfaceName::new("eth0".to_string()), lan_ip, Some(mac.clone()));
         let addresses = vec![
-            crate::domain::DeviceAddress { ip: lan_ip, interface_name: Some(crate::domain::InterfaceName::new("eth0".to_string())) },
-            crate::domain::DeviceAddress { ip: wg_ip, interface_name: None },
+            crate::domain::DeviceAddress { ip: lan_ip, interface_name: Some(crate::domain::InterfaceName::new("eth0".to_string())), neighbor_state: crate::domain::NeighborState::Unknown },
+            crate::domain::DeviceAddress { ip: wg_ip, interface_name: None, neighbor_state: crate::domain::NeighborState::Unknown },
         ];
         let device = NetworkDevice::new(crate::domain::DeviceId::Mac(mac.clone()), addresses, Some(mac));
 
@@ -630,7 +631,7 @@ mod tests {
         let formatter = WaybarFormatter::new();
         let public_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
         let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
-        let address = crate::domain::DeviceAddress { ip: public_ip, interface_name: None };
+        let address = crate::domain::DeviceAddress { ip: public_ip, interface_name: None, neighbor_state: crate::domain::NeighborState::Unknown };
         let device = NetworkDevice::new(crate::domain::DeviceId::Mac(mac.clone()), vec![address], Some(mac));
 
         let data = NetworkData::new(vec![], vec![device], None, vec![]);
@@ -647,8 +648,8 @@ mod tests {
         let public_ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
         let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
         let addresses = vec![
-            crate::domain::DeviceAddress { ip: private_ip, interface_name: Some(crate::domain::InterfaceName::new("eth0".to_string())) },
-            crate::domain::DeviceAddress { ip: public_ip, interface_name: None },
+            crate::domain::DeviceAddress { ip: private_ip, interface_name: Some(crate::domain::InterfaceName::new("eth0".to_string())), neighbor_state: crate::domain::NeighborState::Unknown },
+            crate::domain::DeviceAddress { ip: public_ip, interface_name: None, neighbor_state: crate::domain::NeighborState::Unknown },
         ];
         let device = NetworkDevice::new(crate::domain::DeviceId::Mac(mac.clone()), addresses, Some(mac));
 
@@ -666,7 +667,7 @@ mod tests {
         let formatter = WaybarFormatter::new();
         let link_local: IpAddr = "fe80::1".parse().unwrap();
         let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
-        let address = crate::domain::DeviceAddress { ip: link_local, interface_name: None };
+        let address = crate::domain::DeviceAddress { ip: link_local, interface_name: None, neighbor_state: crate::domain::NeighborState::Unknown };
         let device = NetworkDevice::new(crate::domain::DeviceId::Mac(mac.clone()), vec![address], Some(mac));
 
         let data = NetworkData::new(vec![], vec![device], None, vec![]);
@@ -680,7 +681,7 @@ mod tests {
         let formatter = WaybarFormatter::new();
         let gateway_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
         let mac = MacAddress::new("00:11:22:33:44:55".to_string()).unwrap();
-        let address = crate::domain::DeviceAddress { ip: gateway_ip, interface_name: Some(crate::domain::InterfaceName::new("eth0".to_string())) };
+        let address = crate::domain::DeviceAddress { ip: gateway_ip, interface_name: Some(crate::domain::InterfaceName::new("eth0".to_string())), neighbor_state: crate::domain::NeighborState::Unknown };
         let router = NetworkDevice::new(crate::domain::DeviceId::Mac(mac.clone()), vec![address], Some(mac)).build_identity();
 
         let wan_address = crate::domain::WanAddress::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)));
@@ -739,13 +740,13 @@ mod tests {
 
         let wg_ip = IpAddr::V4(Ipv4Addr::new(10, 20, 30, 3));
         let wg_key = crate::domain::WireGuardPublicKey::new("pubkey123".to_string());
-        let wg_address = crate::domain::DeviceAddress { ip: wg_ip, interface_name: None };
+        let wg_address = crate::domain::DeviceAddress { ip: wg_ip, interface_name: None, neighbor_state: crate::domain::NeighborState::Unknown };
         let wg_device = NetworkDevice::new(crate::domain::DeviceId::WireGuardKey(wg_key), vec![wg_address], None);
 
         // No local interface_name and not WireGuard-keyed: falls into "Other".
         let other_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 200));
         let other_mac = MacAddress::new("11:22:33:44:55:66".to_string()).unwrap();
-        let other_address = crate::domain::DeviceAddress { ip: other_ip, interface_name: None };
+        let other_address = crate::domain::DeviceAddress { ip: other_ip, interface_name: None, neighbor_state: crate::domain::NeighborState::Unknown };
         let other_device = NetworkDevice::new(crate::domain::DeviceId::Mac(other_mac.clone()), vec![other_address], Some(other_mac));
 
         let interface = NetworkInterface::new(crate::domain::InterfaceName::new("eno1".to_string()), eno1_ip, None);

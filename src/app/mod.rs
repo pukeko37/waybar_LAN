@@ -4,7 +4,7 @@
 //! infrastructure adapters implement. No `use crate::infra::` imports here
 //! outside `#[cfg(test)]`.
 
-use crate::domain::{DeviceAddress, DeviceId, DeviceObservation, Hostname, MacAddress, NetworkDevice, NetworkSnapshot, WanAddress, WireGuardActivity, WireGuardPublicKey};
+use crate::domain::{DeviceAddress, DeviceId, DeviceObservation, Hostname, MacAddress, NeighborState, NetworkDevice, NetworkSnapshot, WanAddress, WireGuardActivity, WireGuardPublicKey};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::SystemTime;
@@ -312,7 +312,13 @@ fn build_device(cluster_ips: Vec<IpAddr>, ctx: &BuildContext) -> Option<(Network
         .iter()
         .map(|ip| {
             let interface_name = ctx.by_ip[ip].iter().find_map(|(_, o)| o.interface_name.clone());
-            DeviceAddress { ip: *ip, interface_name }
+            // Per-address reachability, not just the device-level fold
+            // above — lets `primary_address()` tell this specific address
+            // apart from a stale one sharing the same cluster/MAC. Same
+            // "first found, unranked" lookup `interface_name` already uses.
+            let neighbor_state =
+                ctx.by_ip[ip].iter().find_map(|(_, o)| o.neighbor_state).unwrap_or(NeighborState::Unknown);
+            DeviceAddress { ip: *ip, interface_name, neighbor_state }
         })
         .collect();
     addresses.sort_by_key(|a| a.ip);

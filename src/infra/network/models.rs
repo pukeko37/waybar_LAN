@@ -18,9 +18,11 @@ impl TryFrom<NeighborEntryDto> for NetworkDevice {
 
     fn try_from(dto: NeighborEntryDto) -> Result<Self, Self::Error> {
         let mac = MacAddress::new(dto.mac)?;
-        let address = DeviceAddress { ip: dto.ip, interface_name: Some(InterfaceName::new(dto.interface)) };
+        let neighbor_state = NeighborState::from_label(&dto.state);
+        let address =
+            DeviceAddress { ip: dto.ip, interface_name: Some(InterfaceName::new(dto.interface)), neighbor_state };
         let mut device = NetworkDevice::new(DeviceId::Mac(mac.clone()), vec![address], Some(mac));
-        device.neighbor_state = NeighborState::from_label(&dto.state);
+        device.neighbor_state = neighbor_state;
         Ok(device)
     }
 }
