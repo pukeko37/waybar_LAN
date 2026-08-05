@@ -443,8 +443,18 @@ impl NetworkDevice {
             NeighborState::Reachable | NeighborState::Delay | NeighborState::Probe => {
                 ActivityStatus::Active
             }
-            NeighborState::Stale => ActivityStatus::Stale,
-            NeighborState::Failed => ActivityStatus::Stale,
+            // Stale/Failed still consult last_seen's Removed ceiling — a
+            // device the neighbor table keeps reporting as Stale/Failed
+            // must not stay visible forever just because some source keeps
+            // reasserting the entry; see [[device-recency-and-removal]]'s
+            // "Removed, elapsed >= 24h" ceiling, applied uniformly rather
+            // than only when neighbor_state is Unknown.
+            NeighborState::Stale | NeighborState::Failed => {
+                match ActivityStatus::from_last_seen(self.last_seen) {
+                    ActivityStatus::Removed => ActivityStatus::Removed,
+                    _ => ActivityStatus::Stale,
+                }
+            }
             NeighborState::Unknown => ActivityStatus::from_last_seen(self.last_seen),
         }
     }
@@ -633,6 +643,46 @@ mod tests {
             WireGuardActivity::LastHandshake(key, SystemTime::now() - Duration::from_secs(30));
 
         assert_eq!(device.activity_status(), ActivityStatus::Active);
+    }
+
+    #[test]
+    fn test_network_device_activity_status_stale_neighbor_over_a_day_since_last_seen_is_removed() {
+        // Regression test: a device the router's neighbor table still carries
+        // as Stale/Failed used to read Stale forever, no matter how long ago
+        // last_seen actually was — activity_status() only ever consulted
+        // last_seen when neighbor_state was Unknown. A device stuck at Stale
+        // with a day-old last_seen must now be Removed, matching
+        // [[device-recency-and-removal]]'s "Removed, elapsed >= 24h" ceiling,
+        // which the decision states applies uniformly, not only to Unknown.
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99));
+        let address = DeviceAddress { ip, interface_name: None };
+        let mut device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
+        device.neighbor_state = NeighborState::Stale;
+        device.last_seen = SystemTime::now() - Duration::from_secs(86401);
+
+        assert_eq!(device.activity_status(), ActivityStatus::Removed);
+    }
+
+    #[test]
+    fn test_network_device_activity_status_failed_neighbor_over_a_day_since_last_seen_is_removed() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99));
+        let address = DeviceAddress { ip, interface_name: None };
+        let mut device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
+        device.neighbor_state = NeighborState::Failed;
+        device.last_seen = SystemTime::now() - Duration::from_secs(86401);
+
+        assert_eq!(device.activity_status(), ActivityStatus::Removed);
+    }
+
+    #[test]
+    fn test_network_device_activity_status_stale_neighbor_under_a_day_since_last_seen_is_stale() {
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 99));
+        let address = DeviceAddress { ip, interface_name: None };
+        let mut device = NetworkDevice::new(DeviceId::Ip(ip), vec![address], None);
+        device.neighbor_state = NeighborState::Stale;
+        device.last_seen = SystemTime::now() - Duration::from_secs(3600);
+
+        assert_eq!(device.activity_status(), ActivityStatus::Stale);
     }
 
     #[test]
