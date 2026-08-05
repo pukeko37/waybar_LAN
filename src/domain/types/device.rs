@@ -2,7 +2,7 @@
 //! Heuristic identity inference (`build_identity` and friends) lives in the
 //! sibling `inference` module, as a second `impl NetworkDevice` block.
 
-use super::values::{FriendlyName, InterfaceName, MacAddress, ManufacturerName, ServiceInstanceName, ServiceType, WireGuardPublicKey};
+use super::values::{FriendlyName, InterfaceName, MacAddress, ManufacturerName, ServiceInstanceName, ServiceType, SignalStrength, WireGuardPublicKey};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::net::IpAddr;
@@ -404,6 +404,9 @@ pub struct NetworkDevice {
     /// assoclist) MAC match — see [[device-recency-and-removal]]. Feeds
     /// [[infra-display-module-rules]]'s `via Wi-Fi` access-path grouping.
     pub on_wifi: bool,
+    /// Set alongside `on_wifi` by the same `clients` MAC match — `None` for
+    /// every non-Wi-Fi device. See [[wifi-signal-new-device-and-flat-layout]].
+    pub wifi_signal: Option<SignalStrength>,
 }
 
 impl NetworkDevice {
@@ -419,6 +422,7 @@ impl NetworkDevice {
             identity: DeviceIdentity::new(),
             wireguard_activity: WireGuardActivity::NotApplicable,
             on_wifi: false,
+            wifi_signal: None,
         }
     }
 

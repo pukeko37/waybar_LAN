@@ -182,6 +182,24 @@ impl fmt::Display for WanAddress {
     }
 }
 
+/// Wi-Fi signal quality for a station in the router's `clients` (`iwinfo
+/// assoclist`) output — per [[wifi-signal-new-device-and-flat-layout]].
+/// Wraps the output's own pre-computed SNR figure (dB), not the raw RSSI —
+/// SNR is already a single "how good is this link" number, unlike RSSI
+/// which needs a separate noise-floor comparison to mean anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SignalStrength(i32);
+
+impl SignalStrength {
+    pub fn from_snr_db(snr_db: i32) -> Self {
+        Self(snr_db)
+    }
+
+    pub fn snr_db(self) -> i32 {
+        self.0
+    }
+}
+
 /// Whether an address is a private (RFC1918 IPv4) or IPv6 Unique Local
 /// Address (`fc00::/7`). IPv6 link-local (`fe80::/10`) deliberately returns
 /// `false` here — per [[private-address-only-display]], it isn't treated as

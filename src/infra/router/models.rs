@@ -5,8 +5,8 @@
 //! during the `router-integration` decision's verification pass (see the
 //! wiki).
 
-use crate::app::{RouterSourceTier, TieredObservation};
-use crate::domain::{DeviceObservation, MacAddress, NeighborState, WanAddress, WireGuardPublicKey};
+use crate::app::{RouterSourceTier, TieredObservation, WifiClient};
+use crate::domain::{DeviceObservation, MacAddress, NeighborState, SignalStrength, WanAddress, WireGuardPublicKey};
 use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -79,19 +79,31 @@ fn parse_lease_line(line: &str) -> Option<TieredObservation> {
 }
 
 /// Parses `clients` (`iwinfo <radio> assoclist` output, one block per
-/// associated station) into the MAC addresses currently on Wi-Fi. Each
-/// block starts with an unindented line beginning with the station's MAC;
-/// indented `RX:`/`TX:`/`expected throughput:` lines are signal detail,
-/// not needed here. Per [[router-integration]], this is a MAC-keyed side
-/// lookup — it does not produce `DeviceObservation`s or participate in the
-/// merge fold.
-pub fn parse_clients(output: &str) -> Vec<MacAddress> {
+/// associated station). Each block starts with an unindented line
+/// beginning with the station's MAC, its signal (`... (SNR {n}) ...`), and
+/// an age; indented `RX:`/`TX:`/`expected throughput:` lines are per-rate
+/// detail, not needed here. Per [[router-integration]], this is a
+/// MAC-keyed side lookup — it does not produce `DeviceObservation`s or
+/// participate in the merge fold.
+pub fn parse_clients(output: &str) -> Vec<WifiClient> {
     output
         .lines()
         .filter(|line| !line.starts_with(char::is_whitespace) && !line.trim().is_empty())
-        .filter_map(|line| line.split_whitespace().next())
-        .filter_map(|token| MacAddress::new(token.to_string()).ok())
+        .filter_map(parse_client_line)
         .collect()
+}
+
+fn parse_client_line(line: &str) -> Option<WifiClient> {
+    let mac = MacAddress::new(line.split_whitespace().next()?.to_string()).ok()?;
+    Some(WifiClient { mac, signal: parse_snr(line) })
+}
+
+/// Extracts the `SNR {n}` figure from a station line, e.g.
+/// `AE:1F:90:01:8B:1B  -70 dBm / -91 dBm (SNR 21)  28280 ms ago`.
+fn parse_snr(line: &str) -> Option<SignalStrength> {
+    let after = line.split("SNR ").nth(1)?;
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit() || *c == '-').collect();
+    digits.parse::<i32>().ok().map(SignalStrength::from_snr_db)
 }
 
 /// One peer line from `wg-dump` (`sudo wg show all dump`). The router's own
@@ -265,14 +277,28 @@ A4:77:33:2D:B5:01  -80 dBm / -91 dBm (SNR 11)  3460 ms ago
 
     #[test]
     fn test_parse_clients_extracts_only_station_mac_lines() {
-        let macs = parse_clients(CLIENTS_OUTPUT);
+        let clients = parse_clients(CLIENTS_OUTPUT);
         assert_eq!(
-            macs,
+            clients,
             vec![
-                MacAddress::new("AE:1F:90:01:8B:1B".to_string()).unwrap(),
-                MacAddress::new("A4:77:33:2D:B5:01".to_string()).unwrap(),
+                WifiClient {
+                    mac: MacAddress::new("AE:1F:90:01:8B:1B".to_string()).unwrap(),
+                    signal: Some(SignalStrength::from_snr_db(21)),
+                },
+                WifiClient {
+                    mac: MacAddress::new("A4:77:33:2D:B5:01".to_string()).unwrap(),
+                    signal: Some(SignalStrength::from_snr_db(11)),
+                },
             ]
         );
+    }
+
+    #[test]
+    fn test_parse_clients_signal_none_when_snr_unparseable() {
+        let line = "AE:1F:90:01:8B:1B  -70 dBm / -91 dBm (no SNR here)  28280 ms ago";
+        let clients = parse_clients(line);
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].signal, None);
     }
 
     const NEIGH_OUTPUT: &str = "\

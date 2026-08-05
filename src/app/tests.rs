@@ -282,3 +282,45 @@ fn test_merge_wan_address_absent_when_router_silent() {
     let (merged, _history) = merge_network_and_router(local, RouterSnapshot::default(), &HashMap::new());
     assert_eq!(merged.wan_address, None);
 }
+
+#[test]
+fn test_merge_sets_wifi_signal_alongside_on_wifi_for_clients_match() {
+    let ip: IpAddr = "192.168.1.77".parse().unwrap();
+    let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
+    let local = NetworkSnapshot::new(vec![], vec![], None, vec![]);
+
+    let router = RouterSnapshot {
+        observations: vec![TieredObservation {
+            tier: RouterSourceTier::NeighborTable,
+            observation: DeviceObservation::new(ip).with_mac(mac.clone()),
+        }],
+        wifi_clients: vec![crate::app::WifiClient { mac, signal: Some(crate::domain::SignalStrength::from_snr_db(21)) }],
+        wan_address: None,
+    };
+
+    let (merged, _history) = merge_network_and_router(local, router, &HashMap::new());
+    assert_eq!(merged.devices.len(), 1);
+    assert!(merged.devices[0].on_wifi);
+    assert_eq!(merged.devices[0].wifi_signal, Some(crate::domain::SignalStrength::from_snr_db(21)));
+}
+
+#[test]
+fn test_merge_wifi_signal_none_when_no_clients_match() {
+    let ip: IpAddr = "192.168.1.78".parse().unwrap();
+    let mac = MacAddress::new("11:22:33:44:55:66".to_string()).unwrap();
+    let local = NetworkSnapshot::new(vec![], vec![], None, vec![]);
+
+    let router = RouterSnapshot {
+        observations: vec![TieredObservation {
+            tier: RouterSourceTier::NeighborTable,
+            observation: DeviceObservation::new(ip).with_mac(mac),
+        }],
+        wifi_clients: vec![],
+        wan_address: None,
+    };
+
+    let (merged, _history) = merge_network_and_router(local, router, &HashMap::new());
+    assert_eq!(merged.devices.len(), 1);
+    assert!(!merged.devices[0].on_wifi);
+    assert_eq!(merged.devices[0].wifi_signal, None);
+}

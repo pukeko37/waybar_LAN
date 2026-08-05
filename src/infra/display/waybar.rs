@@ -3,7 +3,7 @@
 use crate::app::NetworkFormatter;
 use crate::domain::{
     is_private_address, ActivityStatus, DeviceId, DeviceIdentity, DeviceType, NetworkData,
-    NetworkDevice,
+    NetworkDevice, SignalStrength,
 };
 use anyhow::Result;
 use serde::Serialize;
@@ -94,6 +94,24 @@ fn format_utc_timestamp(time: SystemTime) -> String {
     let hour = secs_of_day / 3600;
     let minute = (secs_of_day % 3600) / 60;
     format!("{:04}-{:02}-{:02} {:02}:{:02}Z", year, month, day, hour, minute)
+}
+
+/// Signal-strength glyph for a Wi-Fi device, tiered by SNR (dB), prepended
+/// before the device-type icon in a fixed-width column — see
+/// [[wifi-signal-new-device-and-flat-layout]]. Plain block characters
+/// (`▂▄▆█`), not emoji, deliberately: single-cell-width and guaranteed to
+/// stay aligned, where a signal-bars emoji's rendered width can vary by
+/// font/terminal. `None` (a non-Wi-Fi device, or a Wi-Fi device whose SNR
+/// couldn't be parsed) gets a blank placeholder of the same width, not an
+/// omitted column, so the device-type icon after it never shifts.
+fn signal_icon(signal: Option<SignalStrength>) -> &'static str {
+    match signal {
+        None => " ",
+        Some(s) if s.snr_db() < 10 => "▂",
+        Some(s) if s.snr_db() < 20 => "▄",
+        Some(s) if s.snr_db() < 30 => "▆",
+        Some(_) => "█",
+    }
 }
 
 /// Emoji for a device type
@@ -297,7 +315,8 @@ impl WaybarFormatter {
         // Main device line
         let display_name = format_identity(&device.identity);
         let colored_name = colorize(device.activity_status(), &display_name);
-        lines.push(format!("{INDENT}{colored_name} ({})", device.primary_address()));
+        let signal = signal_icon(device.wifi_signal);
+        lines.push(format!("{INDENT}{signal}{colored_name} ({})", device.primary_address()));
 
         // Services
         if let Some(services_line) = self.format_services(device) {
@@ -818,5 +837,51 @@ mod tests {
         assert!(!output.tooltip.contains('├'));
         assert!(!output.tooltip.contains('└'));
         assert!(!output.tooltip.contains('│'));
+    }
+
+    #[test]
+    fn test_signal_icon_tiers_by_snr() {
+        assert_eq!(signal_icon(None), " ");
+        assert_eq!(signal_icon(Some(SignalStrength::from_snr_db(5))), "▂");
+        assert_eq!(signal_icon(Some(SignalStrength::from_snr_db(15))), "▄");
+        assert_eq!(signal_icon(Some(SignalStrength::from_snr_db(25))), "▆");
+        assert_eq!(signal_icon(Some(SignalStrength::from_snr_db(35))), "█");
+    }
+
+    #[test]
+    fn test_wifi_device_gets_signal_icon_prefix_non_wifi_gets_blank_placeholder() {
+        let formatter = WaybarFormatter::new();
+
+        let wifi_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 77));
+        let wifi_mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
+        let mut wifi_device = NetworkDevice::new(
+            crate::domain::DeviceId::Mac(wifi_mac.clone()),
+            vec![crate::domain::DeviceAddress {
+                ip: wifi_ip,
+                interface_name: None,
+                neighbor_state: crate::domain::NeighborState::Unknown,
+            }],
+            Some(wifi_mac),
+        );
+        wifi_device.on_wifi = true;
+        wifi_device.wifi_signal = Some(SignalStrength::from_snr_db(35));
+
+        let wired_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
+        let wired_mac = MacAddress::new("11:22:33:44:55:66".to_string()).unwrap();
+        let wired_device = local_device(wired_ip, wired_mac.clone(), "eno1");
+        let interface = NetworkInterface::new(crate::domain::InterfaceName::new("eno1".to_string()), wired_ip, Some(wired_mac));
+
+        let data = NetworkData::new(vec![interface], vec![wifi_device, wired_device], None, vec![]);
+        let output = formatter.format(&data).unwrap();
+
+        // The Wi-Fi row's device line carries the full-signal glyph right
+        // after its INDENT, the wired row's carries the blank placeholder
+        // in that exact same column — same width, same offset either way.
+        // Match on "(ip)" specifically, not a bare ip — the interface
+        // preamble line also contains the wired IP, but never parenthesised.
+        let wifi_row = output.tooltip.lines().find(|l| l.contains(&format!("({wifi_ip})"))).unwrap();
+        let wired_row = output.tooltip.lines().find(|l| l.contains(&format!("({wired_ip})"))).unwrap();
+        assert!(wifi_row.starts_with(&format!("{INDENT}█")));
+        assert!(wired_row.starts_with(&format!("{INDENT} ")));
     }
 }

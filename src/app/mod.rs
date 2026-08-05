@@ -4,7 +4,7 @@
 //! infrastructure adapters implement. No `use crate::infra::` imports here
 //! outside `#[cfg(test)]`.
 
-use crate::domain::{DeviceAddress, DeviceId, DeviceObservation, Hostname, MacAddress, NeighborState, NetworkDevice, NetworkSnapshot, WanAddress, WireGuardActivity, WireGuardPublicKey};
+use crate::domain::{DeviceAddress, DeviceId, DeviceObservation, Hostname, MacAddress, NeighborState, NetworkDevice, NetworkSnapshot, SignalStrength, WanAddress, WireGuardActivity, WireGuardPublicKey};
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::SystemTime;
@@ -36,6 +36,22 @@ pub struct TieredObservation {
     pub observation: DeviceObservation,
 }
 
+/// One associated Wi-Fi station from the `clients` dispatcher command — a
+/// MAC plus its signal quality, per
+/// [[wifi-signal-new-device-and-flat-layout]]. Lives here (not
+/// `infra::router`) for the same reason `TieredObservation`/`RouterSourceTier`
+/// do: it's the shape `app` consumes, and `infra::router` constructs it to
+/// match — production code never imports `infra` types into `app`.
+/// `signal: None` if the source line's signal figure couldn't be parsed —
+/// still counts as "on Wi-Fi" for `on_wifi` tagging below, matching
+/// [[infra-network-module-rules]]'s "partial data beats no data" stance
+/// rather than dropping the whole station over one unparseable figure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WifiClient {
+    pub mac: MacAddress,
+    pub signal: Option<SignalStrength>,
+}
+
 /// Everything the router reports for one collection pass.
 ///
 /// `observations` participate in `app`'s per-field priority fold, keyed by
@@ -46,7 +62,7 @@ pub struct TieredObservation {
 #[derive(Debug, Clone, Default)]
 pub struct RouterSnapshot {
     pub observations: Vec<TieredObservation>,
-    pub wifi_clients: Vec<MacAddress>,
+    pub wifi_clients: Vec<WifiClient>,
     pub wan_address: Option<WanAddress>,
 }
 
@@ -260,7 +276,7 @@ struct BuildContext<'a> {
     local_bases: &'a HashMap<IpAddr, NetworkDevice>,
     /// `router.wifi_clients` — MAC-keyed side lookup, not a fold
     /// participant (see `RouterSnapshot`'s doc comment).
-    wifi_clients: &'a [MacAddress],
+    wifi_clients: &'a [WifiClient],
     /// Persisted per-device last-observed timestamps from the previous
     /// poll, per [[device-recency-and-removal]]. Never consulted for
     /// WireGuard-identified devices — their clock is `wireguard_activity`.
@@ -345,7 +361,9 @@ fn build_device(cluster_ips: Vec<IpAddr>, ctx: &BuildContext) -> Option<(Network
         device.neighbor_state = state;
     }
     device.wireguard_activity = wireguard_activity.unwrap_or(WireGuardActivity::NotApplicable);
-    device.on_wifi = mac.is_some_and(|m| ctx.wifi_clients.contains(&m));
+    let wifi_match = mac.as_ref().and_then(|m| ctx.wifi_clients.iter().find(|c| &c.mac == m));
+    device.on_wifi = wifi_match.is_some();
+    device.wifi_signal = wifi_match.and_then(|c| c.signal);
 
     device = device.build_identity();
     if let Some(friendly_name) = friendly_name {
