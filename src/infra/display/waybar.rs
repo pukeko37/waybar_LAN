@@ -131,21 +131,33 @@ fn device_type_emoji(device_type: DeviceType) -> &'static str {
     }
 }
 
-/// Format device identity with emoji and available information
-/// Format: {Emoji} {Manufacturer} or {Emoji} {FriendlyName} or just {Emoji}
+/// Format device identity with emoji, composing two independent facts
+/// rather than choosing one between them: a *classification* label
+/// (manufacturer + device type together when both are known, either
+/// alone, or the bare `device_type.as_str()` fallback — `"Device"` for
+/// `DeviceType::Unknown` — when neither is) and an *instance* label
+/// (`friendly_name`, when known; `format_device_entry` already appends
+/// `({primary_address})` regardless, so there's no need for a MAC/address
+/// fallback here too). Per [[oui-vendor-lookup-and-composed-identity]]:
+/// manufacturer and friendly_name answer different questions and
+/// shouldn't compete for one slot — once OUI makes manufacturer commonly
+/// available even without a hostname, a winner-take-all chain would start
+/// hiding known hostnames behind a generic vendor name.
+/// Format: `{Emoji} {Classification}` or `{Emoji} {Classification} — {Instance}`
 fn format_identity(identity: &DeviceIdentity) -> String {
     let emoji = device_type_emoji(identity.device_type);
 
-    match &identity.manufacturer {
-        Some(mfr) => format!("{} {}", emoji, mfr.as_str()),
-        None => {
-            if let Some(name) = &identity.friendly_name {
-                format!("{} {}", emoji, name.as_str())
-            } else {
-                // Add device type name as fallback
-                format!("{} {}", emoji, identity.device_type.as_str())
-            }
+    let classification = match &identity.manufacturer {
+        Some(mfr) if identity.device_type != DeviceType::Unknown => {
+            format!("{} {}", mfr.as_str(), identity.device_type.as_str())
         }
+        Some(mfr) => mfr.as_str().to_string(),
+        None => identity.device_type.as_str().to_string(),
+    };
+
+    match &identity.friendly_name {
+        Some(name) => format!("{emoji} {classification} — {}", name.as_str()),
+        None => format!("{emoji} {classification}"),
     }
 }
 
@@ -497,6 +509,48 @@ mod tests {
 
         assert_eq!(output.text, "🖧 No devices");
         assert!(!output.tooltip.is_empty());
+    }
+
+    #[test]
+    fn test_format_identity_composes_manufacturer_type_and_instance_name() {
+        let identity = DeviceIdentity {
+            device_type: DeviceType::Television,
+            manufacturer: Some(crate::domain::ManufacturerName::new("Samsung".to_string())),
+            friendly_name: Some(crate::domain::FriendlyName::new("living-room-tv".to_string())),
+        };
+        assert_eq!(format_identity(&identity), "📺 Samsung Television — living-room-tv");
+    }
+
+    #[test]
+    fn test_format_identity_manufacturer_known_but_no_instance_name() {
+        // The 192.168.1.159 case that motivated this: an OUI hit with no
+        // hostname must not disappear back to a bare device-type fallback.
+        // `device_type` is Unknown here, so the classification is the
+        // manufacturer alone, no redundant "Device" suffix.
+        let identity = DeviceIdentity {
+            device_type: DeviceType::Unknown,
+            manufacturer: Some(crate::domain::ManufacturerName::new("Apple".to_string())),
+            friendly_name: None,
+        };
+        assert_eq!(format_identity(&identity), "🖥  Apple");
+    }
+
+    #[test]
+    fn test_format_identity_instance_name_known_but_no_manufacturer_or_type() {
+        // A known hostname must not get hidden behind a generic type/vendor
+        // fallback — this was the regression this composition exists to avoid.
+        let identity = DeviceIdentity {
+            device_type: DeviceType::Unknown,
+            manufacturer: None,
+            friendly_name: Some(crate::domain::FriendlyName::new("kaukau".to_string())),
+        };
+        assert_eq!(format_identity(&identity), "🖥  Device — kaukau");
+    }
+
+    #[test]
+    fn test_format_identity_nothing_known_falls_back_to_bare_device_type() {
+        let identity = DeviceIdentity::new();
+        assert_eq!(format_identity(&identity), "🖥  Device");
     }
 
     fn local_device(ip: IpAddr, mac: MacAddress, interface: &str) -> NetworkDevice {

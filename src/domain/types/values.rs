@@ -34,6 +34,27 @@ impl MacAddress {
 
         Ok(Self(normalized))
     }
+
+    /// The raw normalized string (`AA:BB:CC:DD:EE:FF`).
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// True when this address is locally administered — the U/L bit (the
+    /// second-least-significant bit of the first octet) is set. Locally
+    /// administered addresses were never IEEE-registered to a vendor at
+    /// all, most commonly because the OS deliberately randomised the
+    /// address (iOS/Android/modern macOS all do this per network by
+    /// default) — a structurally different kind of "no vendor"
+    /// than a universally administered address whose real OUI just isn't
+    /// catalogued anywhere yet. Per
+    /// [[oui-vendor-lookup-and-composed-identity]].
+    pub fn is_locally_administered(&self) -> bool {
+        // Safe: `new` already validated the first two characters are
+        // valid hex before constructing `Self`.
+        let first_octet = u8::from_str_radix(&self.0[0..2], 16).unwrap();
+        first_octet & 0x02 != 0
+    }
 }
 
 impl fmt::Display for MacAddress {
@@ -252,6 +273,30 @@ mod tests {
     fn test_mac_address_invalid_hex() {
         let mac = MacAddress::new("ZZ:BB:CC:DD:EE:FF".to_string());
         assert!(mac.is_err());
+    }
+
+    #[test]
+    fn test_locally_administered_bit_set() {
+        // DE has the U/L bit set (0xDE & 0x02 != 0) — a real iPhone
+        // private-Wi-Fi address observed live.
+        let mac = MacAddress::new("DE:C9:87:75:31:6E".to_string()).unwrap();
+        assert!(mac.is_locally_administered());
+    }
+
+    #[test]
+    fn test_universally_administered_bit_clear() {
+        // 2C has the U/L bit clear — a real Apple-registered OUI.
+        let mac = MacAddress::new("2C:7C:F2:ED:4D:13".to_string()).unwrap();
+        assert!(!mac.is_locally_administered());
+    }
+
+    #[test]
+    fn test_locally_administered_recognises_qemu_convention_prefix_too() {
+        // 52 has the U/L bit set, same as any other locally-administered
+        // address — the table lookup, not this structural check, is what
+        // distinguishes QEMU/libvirt's convention from a random one.
+        let mac = MacAddress::new("52:54:00:AE:AF:A7".to_string()).unwrap();
+        assert!(mac.is_locally_administered());
     }
 
     #[test]

@@ -115,8 +115,20 @@ impl NetworkDevice {
         None
     }
 
-    /// Extract manufacturer from available sources
+    /// Extract manufacturer from available sources. The MAC-derived OUI
+    /// lookup is tried first — it's authoritative on a table hit, where
+    /// the hostname-substring heuristic below is just a guess — and falls
+    /// back to the hostname heuristic for vendors not yet catalogued.
+    /// Both `VendorClassification::LocallyAdministered` and `::Unregistered`
+    /// leave this `None`, same as a hostname miss — no new fallback text
+    /// for either, per [[oui-vendor-lookup-and-composed-identity]].
     fn extract_manufacturer(&self) -> Option<ManufacturerName> {
+        if let Some(mac) = &self.mac
+            && let super::vendor::VendorClassification::Known(vendor) = super::vendor::classify(mac)
+        {
+            return Some(vendor);
+        }
+
         // Extract from hostname
         if let Hostname::Resolved(hostname) = &self.hostname {
             let hostname_lower = hostname.to_lowercase();
@@ -153,5 +165,38 @@ impl NetworkDevice {
         self.services.iter().any(|s|
             s.service_type.as_str().to_lowercase().contains(&service_type.to_lowercase())
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::device::{DeviceId, NetworkDevice};
+    use super::super::values::MacAddress;
+    fn device_with_mac(mac: &str) -> NetworkDevice {
+        let mac = MacAddress::new(mac.to_string()).unwrap();
+        NetworkDevice::new(DeviceId::Mac(mac.clone()), vec![], Some(mac))
+    }
+
+    #[test]
+    fn test_build_identity_gets_manufacturer_from_oui_table_hit() {
+        let device = device_with_mac("2C:7C:F2:ED:4D:13").build_identity();
+        assert_eq!(device.identity.manufacturer.unwrap().as_str(), "Apple");
+    }
+
+    #[test]
+    fn test_build_identity_gets_no_manufacturer_for_locally_administered_mac() {
+        // A real iPhone private-Wi-Fi address, not in the table — must not
+        // fall through to the hostname heuristic and guess wrong either.
+        let device = device_with_mac("DE:C9:87:75:31:6E").build_identity();
+        assert_eq!(device.identity.manufacturer, None);
+    }
+
+    #[test]
+    fn test_build_identity_falls_back_to_hostname_heuristic_when_oui_misses() {
+        use super::super::device::Hostname;
+        let mut device = device_with_mac("00:11:22:33:44:55");
+        device.hostname = Hostname::resolved("brother-mfc-office".to_string());
+        let device = device.build_identity();
+        assert_eq!(device.identity.manufacturer.unwrap().as_str(), "Brother");
     }
 }

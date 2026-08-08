@@ -8,6 +8,8 @@
 //!   definitions in `device` (see [[domain-module-rules]]).
 //! - `snapshot` — top-level aggregates (this host's interfaces, the full
 //!   network snapshot).
+//! - `vendor` — hardcoded MAC-prefix vendor/platform lookup, per
+//!   [[oui-vendor-lookup-and-composed-identity]].
 //!
 //! - All primitives are wrapped in semantic newtypes
 //! - Validation happens at construction time
@@ -17,7 +19,9 @@ mod device;
 mod inference;
 mod snapshot;
 mod values;
+mod vendor;
 
 pub use device::*;
 pub use snapshot::*;
 pub use values::*;
+pub use vendor::*;
