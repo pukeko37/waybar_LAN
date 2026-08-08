@@ -45,6 +45,7 @@ const VENDOR_TABLE: &[(&str, &str)] = &[
     ("A0:02:DC", "Amazon"),
     ("BC:5F:F4", "ASRock"),
     ("52:54:00", "QEMU/KVM"),
+    ("CC:40:D0", "Netgear"),
 ];
 
 /// Classifies a MAC by its 3-octet prefix. The table is checked first,
@@ -94,5 +95,13 @@ mod tests {
     fn test_classify_is_case_insensitive_via_mac_normalization() {
         let mac = MacAddress::new("a4:77:33:2d:b5:01".to_string()).unwrap();
         assert_eq!(classify(&mac), VendorClassification::Known(ManufacturerName::new("Google".to_string())));
+    }
+
+    #[test]
+    fn test_classify_router_netgear_prefix() {
+        // The OpenWrt router itself, 192.168.1.1 — cc:40:d0:5b:16:a0,
+        // read live from `ip neigh`.
+        let mac = MacAddress::new("CC:40:D0:5B:16:A0".to_string()).unwrap();
+        assert_eq!(classify(&mac), VendorClassification::Known(ManufacturerName::new("Netgear".to_string())));
     }
 }
