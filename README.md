@@ -108,7 +108,7 @@ in the tooltip, no router-sourced devices.
 ### Testing with the router integration enabled
 
 Most of the tooltip's structure — the `via WireGuard`, `via Wi-Fi`, and
-`Other` groups, WAN address, gateway DNS enrichment — only appears once a
+`via Router` groups, WAN address, gateway DNS enrichment — only appears once a
 router is configured. `WAYBAR_LAN_ROUTER` is read fresh from the
 environment on every invocation, so it's a per-command flag, not a build
 setting:

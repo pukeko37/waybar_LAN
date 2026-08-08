@@ -247,16 +247,18 @@ impl WaybarFormatter {
     }
 
     /// Groups already-sorted devices by `access_path_annotation`'s value
-    /// (`Other` when `None`), in first-appearance order — whichever group's
-    /// first member appears earliest in `devices` is first in the returned
-    /// list. Within each group, devices keep their existing relative order:
-    /// a stable partition of `devices`, not a re-sort. Per
+    /// (`via Router` when `None` — per [[via-router-heading-rename]], every
+    /// device landing here is known only from a router-reported record,
+    /// never a live signal this poll), in first-appearance order — whichever
+    /// group's first member appears earliest in `devices` is first in the
+    /// returned list. Within each group, devices keep their existing
+    /// relative order: a stable partition of `devices`, not a re-sort. Per
     /// [[nested-tree-by-access-path]].
     fn group_devices_by_access_path<'a>(&self, devices: &[&'a crate::domain::NetworkDevice])
         -> Vec<(String, Vec<&'a crate::domain::NetworkDevice>)> {
         let mut groups: Vec<(String, Vec<&crate::domain::NetworkDevice>)> = Vec::new();
         for &device in devices {
-            let heading = self.access_path_annotation(device).unwrap_or_else(|| "Other".to_string());
+            let heading = self.access_path_annotation(device).unwrap_or_else(|| "via Router".to_string());
             match groups.iter_mut().find(|(existing, _)| existing == &heading) {
                 Some((_, members)) => members.push(device),
                 None => groups.push((heading, vec![device])),
@@ -747,7 +749,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tooltip_groups_devices_by_access_path_with_other_bucket() {
+    fn test_tooltip_groups_devices_by_access_path_with_via_router_bucket() {
         let formatter = WaybarFormatter::new();
 
         let eno1_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 50));
@@ -759,7 +761,7 @@ mod tests {
         let wg_address = crate::domain::DeviceAddress { ip: wg_ip, interface_name: None, neighbor_state: crate::domain::NeighborState::Unknown };
         let wg_device = NetworkDevice::new(crate::domain::DeviceId::WireGuardKey(wg_key), vec![wg_address], None);
 
-        // No local interface_name and not WireGuard-keyed: falls into "Other".
+        // No local interface_name and not WireGuard-keyed: falls into "via Router".
         let other_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 200));
         let other_mac = MacAddress::new("11:22:33:44:55:66".to_string()).unwrap();
         let other_address = crate::domain::DeviceAddress { ip: other_ip, interface_name: None, neighbor_state: crate::domain::NeighborState::Unknown };
@@ -771,13 +773,13 @@ mod tests {
 
         assert!(output.tooltip.contains("via eno1"));
         assert!(output.tooltip.contains("via WireGuard"));
-        assert!(output.tooltip.contains("Other"));
+        assert!(output.tooltip.contains("via Router"));
         // Group order is first-appearance order in the address-sorted device
         // list: 10.20.30.3 (WireGuard) < 192.168.1.50 (eno1) < 192.168.1.200
-        // (Other) numerically, so that's the expected heading order.
+        // (via Router) numerically, so that's the expected heading order.
         let wg_pos = output.tooltip.find("via WireGuard").unwrap();
         let eno1_pos = output.tooltip.find("via eno1").unwrap();
-        let other_pos = output.tooltip.find("Other").unwrap();
+        let other_pos = output.tooltip.find("via Router").unwrap();
         assert!(wg_pos < eno1_pos);
         assert!(eno1_pos < other_pos);
     }
