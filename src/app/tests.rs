@@ -334,7 +334,7 @@ fn test_merge_sets_first_observed_to_now_on_first_ever_appearance() {
     let router = RouterSnapshot {
         observations: vec![TieredObservation {
             tier: RouterSourceTier::NeighborTable,
-            observation: DeviceObservation::new(ip).with_mac(mac),
+            observation: DeviceObservation::new(ip).with_mac(mac).with_neighbor_state(NeighborState::Reachable),
         }],
         wifi_clients: vec![],
         wan_address: None,
@@ -368,7 +368,7 @@ fn test_merge_carries_forward_first_observed_across_polls() {
     let router = RouterSnapshot {
         observations: vec![TieredObservation {
             tier: RouterSourceTier::NeighborTable,
-            observation: DeviceObservation::new(ip).with_mac(mac),
+            observation: DeviceObservation::new(ip).with_mac(mac).with_neighbor_state(NeighborState::Reachable),
         }],
         wifi_clients: vec![],
         wan_address: None,
@@ -407,4 +407,106 @@ fn test_merge_wireguard_device_never_gets_first_observed() {
     assert_eq!(merged.devices[0].first_observed, None);
     assert!(!merged.devices[0].is_newly_observed());
     assert!(!new_history.contains_key(&merged.devices[0].id));
+}
+
+#[test]
+fn test_merge_stale_neigh_state_does_not_refresh_last_observed() {
+    // Regression test for [[neigh-state-activity-fidelity]]: a router's
+    // kernel neighbour-table cache can keep re-reporting a Stale entry
+    // (unconfirmed by any actual traffic — see NeighborState::is_active)
+    // for a device that's long gone. That must not count as a fresh
+    // "seen right now" vote, or the device's 24h Removed ceiling (see
+    // [[device-recency-and-removal]]) never fires — exactly the live bug
+    // this test guards against.
+    let ip: IpAddr = "192.168.1.113".parse().unwrap();
+    let mac = MacAddress::new("06:57:28:00:47:7D".to_string()).unwrap();
+    let id = DeviceId::Mac(mac.clone());
+    let local = NetworkSnapshot::new(vec![], vec![], None, vec![]);
+
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(20 * 60 * 60);
+    let mut history = HashMap::new();
+    history.insert(id.clone(), crate::domain::DeviceHistory { first_observed: long_ago, last_observed: long_ago });
+
+    let router = RouterSnapshot {
+        observations: vec![TieredObservation {
+            tier: RouterSourceTier::NeighborTable,
+            observation: DeviceObservation::new(ip)
+                .with_mac(mac)
+                .with_neighbor_state(NeighborState::Stale),
+        }],
+        wifi_clients: vec![],
+        wan_address: None,
+    };
+
+    let (merged, new_history) = merge_network_and_router(local, router, &history);
+
+    assert_eq!(merged.devices.len(), 1);
+    // A Stale re-report must not refresh the clock — it stays exactly
+    // where the persisted history already had it.
+    assert_eq!(new_history.get(&id).unwrap().last_observed, long_ago);
+    assert_eq!(merged.devices[0].last_seen, long_ago);
+}
+
+#[test]
+fn test_merge_failed_neigh_state_does_not_refresh_last_observed() {
+    // Same as above, for Failed — the kernel actively tried and got no
+    // answer, stronger evidence of absence than Stale, and must
+    // certainly not count as a vote either.
+    let ip: IpAddr = "192.168.1.222".parse().unwrap();
+    let mac = MacAddress::new("A0:02:DC:B7:C8:AC".to_string()).unwrap();
+    let id = DeviceId::Mac(mac.clone());
+    let local = NetworkSnapshot::new(vec![], vec![], None, vec![]);
+
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(20 * 60 * 60);
+    let mut history = HashMap::new();
+    history.insert(id.clone(), crate::domain::DeviceHistory { first_observed: long_ago, last_observed: long_ago });
+
+    let router = RouterSnapshot {
+        observations: vec![TieredObservation {
+            tier: RouterSourceTier::NeighborTable,
+            observation: DeviceObservation::new(ip)
+                .with_mac(mac)
+                .with_neighbor_state(NeighborState::Failed),
+        }],
+        wifi_clients: vec![],
+        wan_address: None,
+    };
+
+    let (merged, new_history) = merge_network_and_router(local, router, &history);
+
+    assert_eq!(merged.devices.len(), 1);
+    assert_eq!(new_history.get(&id).unwrap().last_observed, long_ago);
+    assert_eq!(merged.devices[0].last_seen, long_ago);
+}
+
+#[test]
+fn test_merge_reachable_neigh_state_still_refreshes_last_observed() {
+    // The positive case: a genuinely Reachable neigh entry must still
+    // vote, exactly as before this fix — this decision narrows which
+    // states count, it doesn't remove the vote entirely.
+    let ip: IpAddr = "192.168.1.140".parse().unwrap();
+    let mac = MacAddress::new("BA:BC:C7:95:BC:AE".to_string()).unwrap();
+    let id = DeviceId::Mac(mac.clone());
+    let local = NetworkSnapshot::new(vec![], vec![], None, vec![]);
+
+    let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(20 * 60 * 60);
+    let mut history = HashMap::new();
+    history.insert(id.clone(), crate::domain::DeviceHistory { first_observed: long_ago, last_observed: long_ago });
+
+    let router = RouterSnapshot {
+        observations: vec![TieredObservation {
+            tier: RouterSourceTier::NeighborTable,
+            observation: DeviceObservation::new(ip)
+                .with_mac(mac)
+                .with_neighbor_state(NeighborState::Reachable),
+        }],
+        wifi_clients: vec![],
+        wan_address: None,
+    };
+
+    let (merged, new_history) = merge_network_and_router(local, router, &history);
+
+    assert_eq!(merged.devices.len(), 1);
+    assert!(new_history.get(&id).unwrap().last_observed > long_ago);
+    assert!(merged.devices[0].last_seen > long_ago);
 }

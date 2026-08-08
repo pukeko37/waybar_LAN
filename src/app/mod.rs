@@ -344,12 +344,21 @@ fn build_device(cluster_ips: Vec<IpAddr>, ctx: &BuildContext) -> Option<(Network
 
     // A "neigh vote" — this poll positively placed the device via a live
     // kernel-neighbour-table read, whether this host's own (`LOCAL_RANK`)
-    // or the router's (`RouterSourceTier::NeighborTable`). Both are
-    // equally valid "seen right now" evidence; `leases`/`wg-peers` never
-    // vote (durable bindings, not activity) — see [[device-recency-and-removal]].
-    let neigh_vote = flattened
-        .iter()
-        .any(|(rank, _)| *rank == LOCAL_RANK || *rank == tier_rank(RouterSourceTier::NeighborTable));
+    // or the router's (`RouterSourceTier::NeighborTable`) — *and* the
+    // kernel's own reachability state for that reading says it's actually
+    // current (`NeighborState::is_active`: `Reachable`/`Delay`/`Probe`),
+    // not merely cached (`Stale`/`Unknown`) or explicitly dead (`Failed`).
+    // `leases`/`wg-peers` never vote at all (durable bindings, not
+    // activity) — see [[device-recency-and-removal]]. Per
+    // [[neigh-state-activity-fidelity]]: a `Stale`/`Failed` neigh entry
+    // that a router's kernel keeps re-reporting is not a fresh sighting —
+    // it's a cache the kernel hasn't reconfirmed (or has confirmed dead)
+    // — and must not keep resetting the clock the 24h `Removed` ceiling
+    // depends on.
+    let neigh_vote = flattened.iter().any(|(rank, observation)| {
+        (*rank == LOCAL_RANK || *rank == tier_rank(RouterSourceTier::NeighborTable))
+            && observation.neighbor_state.is_some_and(NeighborState::is_active)
+    });
 
     let base = cluster_ips.iter().find_map(|ip| ctx.local_bases.get(ip).cloned());
     let mut device = base.unwrap_or_else(|| NetworkDevice::new(id.clone(), addresses.clone(), mac.clone()));

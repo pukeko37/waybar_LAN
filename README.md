@@ -101,6 +101,44 @@ The binary will be available at `target/release/waybar_lan`.
 ./target/release/waybar_lan
 ```
 
+Run this way, the widget only sees this host's own local-vantage-point
+data (`ip neigh`, mDNS, reverse DNS) — one flat `via {interface}` group
+in the tooltip, no router-sourced devices.
+
+### Testing with the router integration enabled
+
+Most of the tooltip's structure — the `via WireGuard`, `via Wi-Fi`, and
+`Other` groups, WAN address, gateway DNS enrichment — only appears once a
+router is configured. `WAYBAR_LAN_ROUTER` is read fresh from the
+environment on every invocation, so it's a per-command flag, not a build
+setting:
+
+```bash
+WAYBAR_LAN_ROUTER=user@host ./target/release/waybar_lan
+```
+
+`user@host` is an OpenWrt router reachable over SSH, restricted to the
+dispatcher command whitelist described in `infra-router-module-rules`
+(see the project wiki) — not a general-purpose SSH account. Unset
+entirely, behaviour is identical to omitting the variable: no SSH is
+attempted, and no other behaviour changes.
+
+To eyeball the tooltip instead of raw JSON, `view_tooltip.sh` wraps the
+same call and renders the Pango colour spans as ANSI:
+
+```bash
+WAYBAR_LAN_ROUTER=user@host ./view_tooltip.sh
+```
+
+A deployed widget (e.g. via a NixOS/home-manager config) sets this env
+var alongside its `exec` line — check that config for whether router
+integration is actually enabled in production before assuming local-only
+output matches what's deployed.
+
+`--dump-devices <DIR>` (optionally with `--sanitize`) dumps this host's
+raw pre-filter local collection to JSON files for diagnosis — see
+`--help`. It does not currently include router-sourced raw data.
+
 ## Output Format
 
 The program outputs JSON in the Waybar format:
