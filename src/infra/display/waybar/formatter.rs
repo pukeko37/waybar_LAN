@@ -1,13 +1,13 @@
-//! Waybar JSON output formatting for network data.
+//! `WaybarFormatter`: assembles `WaybarOutput` from `NetworkData` — the
+//! filtering, grouping, and tooltip-building logic that consumes the
+//! presentation primitives in `format.rs`.
 
+use super::format::{colorize, format_identity, format_utc_timestamp, signal_suffix, sub_indent, INDENT};
 use crate::app::NetworkFormatter;
-use crate::domain::{
-    is_private_address, ActivityStatus, DeviceId, DeviceIdentity, DeviceType, NetworkData,
-    NetworkDevice, SignalStrength,
-};
+use crate::domain::{is_private_address, ActivityStatus, DeviceId, NetworkData, NetworkDevice};
 use anyhow::Result;
 use serde::Serialize;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 /// Waybar output format
 #[derive(Debug, Clone, Serialize)]
@@ -20,145 +20,6 @@ pub struct WaybarOutput {
     pub class: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub percentage: Option<u8>,
-}
-
-/// Get Pango markup for coloring text based on activity status
-fn pango_color(status: ActivityStatus) -> (&'static str, &'static str) {
-    match status {
-        ActivityStatus::Active => ("<span color='#00FF00'>", "</span>"), // Green
-        ActivityStatus::Recent => ("<span color='#FFFF00'>", "</span>"), // Yellow
-        ActivityStatus::Idle => ("", ""),                                // White (default)
-        ActivityStatus::Stale => ("<span color='#888888'>", "</span>"), // Grey
-        // Removed devices are filtered out of the tooltip before rendering
-        // (see WaybarFormatter::format) — this arm should be unreachable in
-        // practice. Rust's exhaustiveness check still requires it, so it's
-        // handled the same as Stale rather than with `unreachable!()`: if
-        // the filter and this match ever drift apart, a grey fallback is
-        // the safe failure for a UI widget, not a panic.
-        ActivityStatus::Removed => ("<span color='#888888'>", "</span>"),
-    }
-}
-
-/// Wrap text with color markup based on activity status
-fn colorize(status: ActivityStatus, text: &str) -> String {
-    let (start, end) = pango_color(status);
-    format!("{}{}{}", start, text, end)
-}
-
-/// Fixed indent for a device row under its group heading, per
-/// [[wifi-signal-new-device-and-flat-layout]] — supersedes the
-/// [[nested-tree-by-access-path]] tree-glyph nesting this replaced.
-/// Illustrative width (~3 em-dash-widths, Andrew's stated target); exact
-/// character count is a visual-tuning call against the tooltip's actual
-/// Pango-rendered font, not derived from character-width arithmetic.
-const INDENT: &str = "      ";
-
-/// A device row's sub-lines (`Services`, `Gateway`/`WAN`/`DNS`) indent one
-/// further `INDENT` step beyond their device row — not an independently
-/// tuned second value.
-fn sub_indent() -> String {
-    format!("{INDENT}{INDENT}")
-}
-
-/// Splits a Unix day count into (year, month, day), proleptic Gregorian
-/// calendar. Howard Hinnant's `civil_from_days` algorithm — a closed-form
-/// calculation with no lookup tables — chosen per [[updated-timestamp-footer]]
-/// because [[waybar-lan-workspace-rules]] rules out the `time`/`chrono`
-/// crates `waybar_weather` uses for its equivalent "Updated:" footer, in
-/// favour of `std::time` alone.
-fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
-    let z = days_since_epoch + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z.rem_euclid(146097); // [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
-    let mp = (5 * doy + 2) / 153; // [0, 11]
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
-    let year = if month <= 2 { y + 1 } else { y };
-    (year, month, day)
-}
-
-/// Formats a `SystemTime` as `YYYY-MM-DD HH:MMZ` (UTC), matching the
-/// "Updated:" footer format `waybar_weather`'s `LastUpdated::format_display`
-/// produces, per [[updated-timestamp-footer]].
-fn format_utc_timestamp(time: SystemTime) -> String {
-    let total_secs = time
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let days = total_secs.div_euclid(86400);
-    let secs_of_day = total_secs.rem_euclid(86400);
-    let (year, month, day) = civil_from_days(days);
-    let hour = secs_of_day / 3600;
-    let minute = (secs_of_day % 3600) / 60;
-    format!("{:04}-{:02}-{:02} {:02}:{:02}Z", year, month, day, hour, minute)
-}
-
-/// Signal-strength glyph for a Wi-Fi device, tiered by SNR (dB), prepended
-/// before the device-type icon in a fixed-width column — see
-/// [[wifi-signal-new-device-and-flat-layout]]. Plain block characters
-/// (`▂▄▆█`), not emoji, deliberately: single-cell-width and guaranteed to
-/// stay aligned, where a signal-bars emoji's rendered width can vary by
-/// font/terminal. `None` (a non-Wi-Fi device, or a Wi-Fi device whose SNR
-/// couldn't be parsed) gets a blank placeholder of the same width, not an
-/// omitted column, so the device-type icon after it never shifts.
-fn signal_icon(signal: Option<SignalStrength>) -> &'static str {
-    match signal {
-        None => " ",
-        Some(s) if s.snr_db() < 10 => "▂",
-        Some(s) if s.snr_db() < 20 => "▄",
-        Some(s) if s.snr_db() < 30 => "▆",
-        Some(_) => "█",
-    }
-}
-
-/// Emoji for a device type
-fn device_type_emoji(device_type: DeviceType) -> &'static str {
-    match device_type {
-        DeviceType::Television => "📺",
-        DeviceType::Printer => "🖨 ",     // Extra space for alignment
-        DeviceType::Router => "🌐",
-        DeviceType::Computer => "💻",
-        DeviceType::NAS => "🗄",
-        DeviceType::MobileDevice => "📞", // Telephone receiver for phones
-        DeviceType::Tablet => "📋",       // Clipboard for tablets
-        DeviceType::Speaker => "🔊",
-        DeviceType::StreamingDevice => "📺",
-        DeviceType::SmartHome => "🏠",
-        DeviceType::Unknown => "🖥 ",     // Extra space for alignment
-    }
-}
-
-/// Format device identity with emoji, composing two independent facts
-/// rather than choosing one between them: a *classification* label
-/// (manufacturer + device type together when both are known, either
-/// alone, or the bare `device_type.as_str()` fallback — `"Device"` for
-/// `DeviceType::Unknown` — when neither is) and an *instance* label
-/// (`friendly_name`, when known; `format_device_entry` already appends
-/// `({primary_address})` regardless, so there's no need for a MAC/address
-/// fallback here too). Per [[oui-vendor-lookup-and-composed-identity]]:
-/// manufacturer and friendly_name answer different questions and
-/// shouldn't compete for one slot — once OUI makes manufacturer commonly
-/// available even without a hostname, a winner-take-all chain would start
-/// hiding known hostnames behind a generic vendor name.
-/// Format: `{Emoji} {Classification}` or `{Emoji} {Classification} — {Instance}`
-fn format_identity(identity: &DeviceIdentity) -> String {
-    let emoji = device_type_emoji(identity.device_type);
-
-    let classification = match &identity.manufacturer {
-        Some(mfr) if identity.device_type != DeviceType::Unknown => {
-            format!("{} {}", mfr.as_str(), identity.device_type.as_str())
-        }
-        Some(mfr) => mfr.as_str().to_string(),
-        None => identity.device_type.as_str().to_string(),
-    };
-
-    match &identity.friendly_name {
-        Some(name) => format!("{emoji} {classification} — {}", name.as_str()),
-        None => format!("{emoji} {classification}"),
-    }
 }
 
 /// Formats network data as Waybar JSON
@@ -321,7 +182,11 @@ impl WaybarFormatter {
     }
 
     /// Format a single device entry with its services and gateway info,
-    /// indented one `INDENT` step under its group heading.
+    /// indented one `INDENT` step under its group heading. The line ends
+    /// with, in order: the primary address parenthetical, the new-device
+    /// star marker, then the Wi-Fi signal-strength suffix — per
+    /// [[wifi-signal-icon-at-line-end]], the signal glyph sits last on the
+    /// line rather than prepended before the device-type icon.
     fn format_device_entry(&self, device: &crate::domain::NetworkDevice,
         network_data: &NetworkData) -> Vec<String> {
         let mut lines = Vec::new();
@@ -329,9 +194,9 @@ impl WaybarFormatter {
         // Main device line
         let display_name = format_identity(&device.identity);
         let colored_name = colorize(device.activity_status(), &display_name);
-        let signal = signal_icon(device.wifi_signal);
         let new_marker = if device.is_newly_observed() { " <span color='#00FF00'>★</span>" } else { "" };
-        lines.push(format!("{INDENT}{signal}{colored_name} ({}){new_marker}", device.primary_address()));
+        let signal = signal_suffix(device.wifi_signal);
+        lines.push(format!("{INDENT}{colored_name} ({}){new_marker}{signal}", device.primary_address()));
 
         // Services
         if let Some(services_line) = self.format_services(device) {
@@ -483,7 +348,7 @@ impl Default for WaybarFormatter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Gateway, MacAddress, NetworkDevice, NetworkInterface};
+    use crate::domain::{Gateway, MacAddress, NetworkDevice, NetworkInterface, SignalStrength};
     use std::net::{IpAddr, Ipv4Addr};
 
     #[test]
@@ -509,48 +374,6 @@ mod tests {
 
         assert_eq!(output.text, "🖧 No devices");
         assert!(!output.tooltip.is_empty());
-    }
-
-    #[test]
-    fn test_format_identity_composes_manufacturer_type_and_instance_name() {
-        let identity = DeviceIdentity {
-            device_type: DeviceType::Television,
-            manufacturer: Some(crate::domain::ManufacturerName::new("Samsung".to_string())),
-            friendly_name: Some(crate::domain::FriendlyName::new("living-room-tv".to_string())),
-        };
-        assert_eq!(format_identity(&identity), "📺 Samsung Television — living-room-tv");
-    }
-
-    #[test]
-    fn test_format_identity_manufacturer_known_but_no_instance_name() {
-        // The 192.168.1.159 case that motivated this: an OUI hit with no
-        // hostname must not disappear back to a bare device-type fallback.
-        // `device_type` is Unknown here, so the classification is the
-        // manufacturer alone, no redundant "Device" suffix.
-        let identity = DeviceIdentity {
-            device_type: DeviceType::Unknown,
-            manufacturer: Some(crate::domain::ManufacturerName::new("Apple".to_string())),
-            friendly_name: None,
-        };
-        assert_eq!(format_identity(&identity), "🖥  Apple");
-    }
-
-    #[test]
-    fn test_format_identity_instance_name_known_but_no_manufacturer_or_type() {
-        // A known hostname must not get hidden behind a generic type/vendor
-        // fallback — this was the regression this composition exists to avoid.
-        let identity = DeviceIdentity {
-            device_type: DeviceType::Unknown,
-            manufacturer: None,
-            friendly_name: Some(crate::domain::FriendlyName::new("kaukau".to_string())),
-        };
-        assert_eq!(format_identity(&identity), "🖥  Device — kaukau");
-    }
-
-    #[test]
-    fn test_format_identity_nothing_known_falls_back_to_bare_device_type() {
-        let identity = DeviceIdentity::new();
-        assert_eq!(format_identity(&identity), "🖥  Device");
     }
 
     fn local_device(ip: IpAddr, mac: MacAddress, interface: &str) -> NetworkDevice {
@@ -781,18 +604,6 @@ mod tests {
     }
 
     #[test]
-    fn test_format_utc_timestamp_known_epoch() {
-        // 2023-01-13 14:30:00 UTC, per waybar_weather's own equivalent test fixture.
-        let time = UNIX_EPOCH + std::time::Duration::from_secs(1673620200);
-        assert_eq!(format_utc_timestamp(time), "2023-01-13 14:30Z");
-    }
-
-    #[test]
-    fn test_format_utc_timestamp_epoch_zero() {
-        assert_eq!(format_utc_timestamp(UNIX_EPOCH), "1970-01-01 00:00Z");
-    }
-
-    #[test]
     fn test_tooltip_ends_with_updated_footer() {
         let formatter = WaybarFormatter::new();
         let data = NetworkData::new(vec![], vec![], None, vec![]);
@@ -897,16 +708,12 @@ mod tests {
     }
 
     #[test]
-    fn test_signal_icon_tiers_by_snr() {
-        assert_eq!(signal_icon(None), " ");
-        assert_eq!(signal_icon(Some(SignalStrength::from_snr_db(5))), "▂");
-        assert_eq!(signal_icon(Some(SignalStrength::from_snr_db(15))), "▄");
-        assert_eq!(signal_icon(Some(SignalStrength::from_snr_db(25))), "▆");
-        assert_eq!(signal_icon(Some(SignalStrength::from_snr_db(35))), "█");
-    }
-
-    #[test]
-    fn test_wifi_device_gets_signal_icon_prefix_non_wifi_gets_blank_placeholder() {
+    fn test_wifi_device_gets_signal_suffix_at_line_end_non_wifi_gets_none() {
+        // Per [[wifi-signal-icon-at-line-end]]: the signal glyph now trails
+        // the device line entirely rather than prepending a fixed-width
+        // column before the device-type icon — every row's INDENT + icon
+        // starts at the same position regardless of Wi-Fi status, and a
+        // non-Wi-Fi row carries no signal-related content at all.
         let formatter = WaybarFormatter::new();
 
         let wifi_ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 77));
@@ -931,15 +738,52 @@ mod tests {
         let data = NetworkData::new(vec![interface], vec![wifi_device, wired_device], None, vec![]);
         let output = formatter.format(&data).unwrap();
 
-        // The Wi-Fi row's device line carries the full-signal glyph right
-        // after its INDENT, the wired row's carries the blank placeholder
-        // in that exact same column — same width, same offset either way.
         // Match on "(ip)" specifically, not a bare ip — the interface
         // preamble line also contains the wired IP, but never parenthesised.
         let wifi_row = output.tooltip.lines().find(|l| l.contains(&format!("({wifi_ip})"))).unwrap();
         let wired_row = output.tooltip.lines().find(|l| l.contains(&format!("({wired_ip})"))).unwrap();
-        assert!(wifi_row.starts_with(&format!("{INDENT}█")));
-        assert!(wired_row.starts_with(&format!("{INDENT} ")));
+
+        assert!(wifi_row.ends_with(" █"));
+        assert!(!wired_row.contains('█'));
+
+        // Neither row carries a leading signal-glyph column any more — both
+        // start with exactly INDENT and nothing variable-width ahead of the
+        // device-type icon, which is what actually fixes the alignment bug
+        // [[wifi-signal-icon-at-line-end]] was written for.
+        assert!(wifi_row.starts_with(INDENT));
+        assert!(wired_row.starts_with(INDENT));
+        for glyph in ['▂', '▄', '▆', '█'] {
+            assert!(!wifi_row[INDENT.len()..].starts_with(glyph));
+            assert!(!wired_row[INDENT.len()..].starts_with(glyph));
+        }
+    }
+
+    #[test]
+    fn test_newly_observed_device_gets_green_star_before_signal_suffix_at_line_end() {
+        let formatter = WaybarFormatter::new();
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 77));
+        let mac = MacAddress::new("AA:BB:CC:DD:EE:FF".to_string()).unwrap();
+        let interface = NetworkInterface::new(crate::domain::InterfaceName::new("eno1".to_string()), ip, Some(mac.clone()));
+        let mut device = NetworkDevice::new(
+            crate::domain::DeviceId::Mac(mac.clone()),
+            vec![crate::domain::DeviceAddress {
+                ip,
+                interface_name: None,
+                neighbor_state: crate::domain::NeighborState::Unknown,
+            }],
+            Some(mac),
+        );
+        device.on_wifi = true;
+        device.wifi_signal = Some(SignalStrength::from_snr_db(35));
+        device.first_observed = Some(std::time::SystemTime::now() - std::time::Duration::from_secs(3600));
+
+        let data = NetworkData::new(vec![interface], vec![device], None, vec![]);
+        let output = formatter.format(&data).unwrap();
+
+        let device_row = output.tooltip.lines().find(|l| l.contains(&format!("({ip})"))).unwrap();
+        // Star comes before the signal suffix — the signal glyph is the
+        // true last thing on the line.
+        assert!(device_row.ends_with("★</span> █"));
     }
 
     #[test]
