@@ -46,6 +46,7 @@ const VENDOR_TABLE: &[(&str, &str)] = &[
     ("BC:5F:F4", "ASRock"),
     ("52:54:00", "QEMU/KVM"),
     ("CC:40:D0", "Netgear"),
+    ("24:E4:CE", "Kaon Group"),
 ];
 
 /// Classifies a MAC by its 3-octet prefix. The table is checked first,
@@ -103,5 +104,12 @@ mod tests {
         // read live from `ip neigh`.
         let mac = MacAddress::new("CC:40:D0:5B:16:A0".to_string()).unwrap();
         assert_eq!(classify(&mac), VendorClassification::Known(ManufacturerName::new("Netgear".to_string())));
+    }
+
+    #[test]
+    fn test_classify_kaon_group_prefix() {
+        // Observed live on Andrew's network — 24:e4:ce:f6:6c:4c.
+        let mac = MacAddress::new("24:E4:CE:F6:6C:4C".to_string()).unwrap();
+        assert_eq!(classify(&mac), VendorClassification::Known(ManufacturerName::new("Kaon Group".to_string())));
     }
 }
